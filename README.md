@@ -28,6 +28,7 @@ It hosts a local MCP-compatible HTTP endpoint. When it receives a valid handoff 
 - Health check: `GET /health`
 - Supported methods: `initialize`, `tools/list`, `tools/call`, `ping`
 - Tool name: `patchwalk.play`
+- Standalone schema file: `schema/handoff-1.0.schema.json`
 
 `tools/call` accepts the handoff payload either directly in `params.arguments` or wrapped in `params.arguments.payload`.
 
@@ -92,6 +93,7 @@ Expected result: VS Code focuses the file/range and narrates each step in sequen
 
 ```bash
 pnpm install
+pnpm generate:schema
 pnpm esbuild:base
 ```
 

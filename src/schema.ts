@@ -1,35 +1,69 @@
-export type PatchwalkTargetType = 'symbol' | 'range' | 'line';
+import { z } from 'zod';
 
-export interface PatchwalkRange {
-    startLine: number;
-    endLine: number;
-}
+export const PATCHWALK_HANDOFF_SCHEMA_URL = 'https://patchwalk.dev/schema/handoff-1.0.schema.json';
 
-export interface PatchwalkProducer {
-    agent: string;
-    agentVersion?: string;
-    model?: string;
-}
+const nonEmptyStringPattern = /\S/;
 
-export interface PatchwalkWalkthroughStep {
-    id: string;
-    title: string;
-    narration: string;
-    path: string;
-    type?: PatchwalkTargetType;
-    symbol?: string;
-    range: PatchwalkRange;
-}
+const nonEmptyStringSchema = z
+    .string()
+    .min(1, 'must not be empty.')
+    .regex(nonEmptyStringPattern, 'must contain at least one non-whitespace character.');
 
-export interface PatchwalkHandoffPayload {
-    $schema?: string;
-    specVersion: string;
-    handoffId: string;
-    createdAt: string;
-    producer: PatchwalkProducer;
-    summary: string;
-    walkthrough: PatchwalkWalkthroughStep[];
-}
+const positiveIntegerSchema = z.number().int().gte(1);
+
+export const patchwalkTargetTypeSchema = z.enum(['symbol', 'range', 'line']);
+
+export const patchwalkRangeSchema = z
+    .strictObject({
+        startLine: positiveIntegerSchema,
+        endLine: positiveIntegerSchema,
+    })
+    .superRefine((value, context) => {
+        if (value.endLine < value.startLine) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['endLine'],
+                message: 'must be greater than or equal to startLine.',
+            });
+        }
+    });
+
+export const patchwalkProducerSchema = z.strictObject({
+    agent: nonEmptyStringSchema,
+    agentVersion: nonEmptyStringSchema.optional(),
+    model: nonEmptyStringSchema.optional(),
+});
+
+export const patchwalkWalkthroughStepSchema = z.strictObject({
+    id: nonEmptyStringSchema,
+    title: nonEmptyStringSchema,
+    narration: nonEmptyStringSchema,
+    path: nonEmptyStringSchema,
+    type: patchwalkTargetTypeSchema.optional(),
+    symbol: nonEmptyStringSchema.optional(),
+    range: patchwalkRangeSchema,
+});
+
+export const patchwalkHandoffPayloadSchema = z
+    .strictObject({
+        $schema: nonEmptyStringSchema.optional(),
+        specVersion: nonEmptyStringSchema,
+        handoffId: nonEmptyStringSchema,
+        createdAt: z.iso.datetime({ offset: true }),
+        producer: patchwalkProducerSchema,
+        summary: nonEmptyStringSchema,
+        walkthrough: z.array(patchwalkWalkthroughStepSchema),
+    })
+    .meta({
+        $id: PATCHWALK_HANDOFF_SCHEMA_URL,
+        title: 'Patchwalk handoff payload',
+    });
+
+export type PatchwalkTargetType = z.infer<typeof patchwalkTargetTypeSchema>;
+export type PatchwalkRange = z.infer<typeof patchwalkRangeSchema>;
+export type PatchwalkProducer = z.infer<typeof patchwalkProducerSchema>;
+export type PatchwalkWalkthroughStep = z.infer<typeof patchwalkWalkthroughStepSchema>;
+export type PatchwalkHandoffPayload = z.infer<typeof patchwalkHandoffPayloadSchema>;
 
 interface PatchwalkValidationSuccess {
     ok: true;
@@ -43,125 +77,104 @@ interface PatchwalkValidationFailure {
 
 export type PatchwalkValidationResult = PatchwalkValidationSuccess | PatchwalkValidationFailure;
 
-const isRecord = (value: unknown): value is Record<string, unknown> => {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
-};
+type JsonPrimitive = boolean | null | number | string;
+type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+export interface JsonObject {
+    [key: string]: JsonValue;
+}
 
-const asNonEmptyString = (value: unknown, fieldName: string): string => {
-    if (typeof value !== 'string' || value.trim().length === 0) {
-        throw new TypeError(`Field "${fieldName}" must be a non-empty string.`);
+const toSerializableJson = (value: unknown): JsonValue => {
+    if (
+        value === null ||
+        typeof value === 'boolean' ||
+        typeof value === 'number' ||
+        typeof value === 'string'
+    ) {
+        return value;
     }
 
-    return value;
-};
-
-const asPositiveInteger = (value: unknown, fieldName: string): number => {
-    if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
-        throw new TypeError(`Field "${fieldName}" must be a positive integer.`);
+    if (Array.isArray(value)) {
+        return value.map((item) => toSerializableJson(item));
     }
 
-    return value;
-};
-
-const normalizeRange = (value: unknown, fieldName: string): PatchwalkRange => {
-    if (!isRecord(value)) {
-        throw new TypeError(`Field "${fieldName}" must be an object.`);
-    }
-
-    const startLine = asPositiveInteger(value.startLine, `${fieldName}.startLine`);
-    const endLine = asPositiveInteger(value.endLine, `${fieldName}.endLine`);
-
-    if (endLine < startLine) {
-        throw new TypeError(`Field "${fieldName}.endLine" must be >= "${fieldName}.startLine".`);
-    }
-
-    return { startLine, endLine };
-};
-
-const normalizeStep = (value: unknown, index: number): PatchwalkWalkthroughStep => {
-    if (!isRecord(value)) {
-        throw new TypeError(`walkthrough[${index}] must be an object.`);
-    }
-
-    const step: PatchwalkWalkthroughStep = {
-        id: asNonEmptyString(value.id, `walkthrough[${index}].id`),
-        title: asNonEmptyString(value.title, `walkthrough[${index}].title`),
-        narration: asNonEmptyString(value.narration, `walkthrough[${index}].narration`),
-        path: asNonEmptyString(value.path, `walkthrough[${index}].path`),
-        range: normalizeRange(value.range, `walkthrough[${index}].range`),
-    };
-
-    if (value.type !== undefined) {
-        const type = asNonEmptyString(value.type, `walkthrough[${index}].type`);
-        if (type !== 'symbol' && type !== 'range' && type !== 'line') {
-            throw new TypeError(
-                `Field "walkthrough[${index}].type" must be one of: symbol, range, line.`,
-            );
+    if (typeof value === 'object') {
+        const serializableObject: JsonObject = {};
+        for (const [key, nestedValue] of Object.entries(value)) {
+            if (nestedValue !== undefined) {
+                serializableObject[key] = toSerializableJson(nestedValue);
+            }
         }
 
-        step.type = type;
+        return serializableObject;
     }
 
-    if (value.symbol !== undefined) {
-        step.symbol = asNonEmptyString(value.symbol, `walkthrough[${index}].symbol`);
+    throw new TypeError('Value is not JSON serializable.');
+};
+
+const toSerializableJsonObject = (value: unknown): JsonObject => {
+    const serializableValue = toSerializableJson(value);
+
+    if (Array.isArray(serializableValue) || serializableValue === null) {
+        throw new TypeError('Expected a JSON object.');
     }
 
-    return step;
+    if (typeof serializableValue !== 'object') {
+        throw new TypeError('Expected a JSON object.');
+    }
+
+    return serializableValue;
+};
+
+export const patchwalkHandoffJsonSchema = toSerializableJsonObject(
+    z.toJSONSchema(patchwalkHandoffPayloadSchema),
+);
+
+const formatIssuePath = (path: PropertyKey[]): string => {
+    return path.reduce<string>((formattedPath, segment) => {
+        if (typeof segment === 'number') {
+            return `${formattedPath}[${segment}]`;
+        }
+
+        const segmentText = String(segment);
+        if (!formattedPath) {
+            return segmentText;
+        }
+
+        return `${formattedPath}.${segmentText}`;
+    }, '');
+};
+
+const formatValidationIssue = (issue: z.ZodIssue): string => {
+    if (issue.code === 'unrecognized_keys') {
+        const issuePath = formatIssuePath(issue.path);
+        const location = issuePath ? ` at "${issuePath}"` : '';
+        const label = issue.keys.length === 1 ? 'field' : 'fields';
+        return `Unexpected ${label}${location}: ${issue.keys.join(', ')}.`;
+    }
+
+    const issuePath = formatIssuePath(issue.path);
+    if (issuePath) {
+        return `Field "${issuePath}": ${issue.message}`;
+    }
+
+    return issue.message;
 };
 
 export const validatePatchwalkPayload = (value: unknown): PatchwalkValidationResult => {
-    try {
-        if (!isRecord(value)) {
-            throw new TypeError('Payload must be a JSON object.');
-        }
+    const result = patchwalkHandoffPayloadSchema.safeParse(value);
 
-        const createdAt = asNonEmptyString(value.createdAt, 'createdAt');
-        if (Number.isNaN(new Date(createdAt).getTime())) {
-            throw new TypeError('Field "createdAt" must be a valid ISO date string.');
-        }
-
-        if (!isRecord(value.producer)) {
-            throw new TypeError('Field "producer" must be an object.');
-        }
-
-        const walkthroughRaw = value.walkthrough;
-        if (!Array.isArray(walkthroughRaw)) {
-            throw new TypeError('Field "walkthrough" must be an array.');
-        }
-
-        const walkthrough = walkthroughRaw.map((step, index) => normalizeStep(step, index));
-
-        const normalized: PatchwalkHandoffPayload = {
-            specVersion: asNonEmptyString(value.specVersion, 'specVersion'),
-            handoffId: asNonEmptyString(value.handoffId, 'handoffId'),
-            createdAt,
-            producer: {
-                agent: asNonEmptyString(value.producer.agent, 'producer.agent'),
-                agentVersion:
-                    value.producer.agentVersion === undefined
-                        ? undefined
-                        : asNonEmptyString(value.producer.agentVersion, 'producer.agentVersion'),
-                model:
-                    value.producer.model === undefined
-                        ? undefined
-                        : asNonEmptyString(value.producer.model, 'producer.model'),
-            },
-            summary: asNonEmptyString(value.summary, 'summary'),
-            walkthrough,
-        };
-
-        if (typeof value.$schema === 'string' && value.$schema.trim().length > 0) {
-            normalized.$schema = value.$schema;
-        }
-
+    if (result.success) {
         return {
             ok: true,
-            value: normalized,
-        };
-    } catch (error) {
-        return {
-            ok: false,
-            error: error instanceof Error ? error.message : 'Invalid payload.',
+            value: result.data,
         };
     }
+
+    return {
+        ok: false,
+        error:
+            result.error.issues.length > 0
+                ? formatValidationIssue(result.error.issues[0])
+                : 'Invalid payload.',
+    };
 };

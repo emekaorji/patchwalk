@@ -5,7 +5,7 @@ import { createServer } from 'node:http';
 import type * as vscode from 'vscode';
 
 import type { PatchwalkHandoffPayload } from './schema';
-import { validatePatchwalkPayload } from './schema';
+import { patchwalkHandoffJsonSchema, validatePatchwalkPayload } from './schema';
 
 interface PatchwalkMcpServerOptions {
     port: number;
@@ -146,13 +146,14 @@ export class PatchwalkMcpServer {
     }
 
     private async readJsonBody(request: IncomingMessage): Promise<unknown> {
-        const bodyChunks: Buffer[] = [];
+        const bodyChunks: Uint8Array[] = [];
         let totalSize = 0;
         const maxBytes = 2 * 1024 * 1024;
 
         for await (const chunk of request) {
-            const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-            totalSize += chunkBuffer.length;
+            const chunkBuffer =
+                typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
+            totalSize += chunkBuffer.byteLength;
 
             if (totalSize > maxBytes) {
                 throw new Error('Request body is too large.');
@@ -247,58 +248,7 @@ export class PatchwalkMcpServer {
                         name: 'patchwalk.play',
                         description:
                             'Play a Patchwalk handoff payload inside VS Code with file navigation and narration.',
-                        inputSchema: {
-                            type: 'object',
-                            required: [
-                                'specVersion',
-                                'handoffId',
-                                'createdAt',
-                                'producer',
-                                'summary',
-                                'walkthrough',
-                            ],
-                            properties: {
-                                specVersion: { type: 'string' },
-                                handoffId: { type: 'string' },
-                                createdAt: { type: 'string', format: 'date-time' },
-                                producer: {
-                                    type: 'object',
-                                    required: ['agent'],
-                                    properties: {
-                                        agent: { type: 'string' },
-                                        agentVersion: { type: 'string' },
-                                        model: { type: 'string' },
-                                    },
-                                },
-                                summary: { type: 'string' },
-                                walkthrough: {
-                                    type: 'array',
-                                    items: {
-                                        type: 'object',
-                                        required: ['id', 'title', 'narration', 'path', 'range'],
-                                        properties: {
-                                            id: { type: 'string' },
-                                            title: { type: 'string' },
-                                            narration: { type: 'string' },
-                                            path: { type: 'string' },
-                                            type: {
-                                                type: 'string',
-                                                enum: ['symbol', 'range', 'line'],
-                                            },
-                                            symbol: { type: 'string' },
-                                            range: {
-                                                type: 'object',
-                                                required: ['startLine', 'endLine'],
-                                                properties: {
-                                                    startLine: { type: 'integer', minimum: 1 },
-                                                    endLine: { type: 'integer', minimum: 1 },
-                                                },
-                                            },
-                                        },
-                                    },
-                                },
-                            },
-                        },
+                        inputSchema: patchwalkHandoffJsonSchema,
                     },
                 ],
             };

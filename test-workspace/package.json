@@ -1,3 +1,12 @@
 {
-    "name": "test-workspace"
+    "name": "patchwalk-demo-workspace",
+    "private": true,
+    "version": "0.1.0",
+    "type": "module",
+    "description": "Demo service used for Patchwalk manual playback tests.",
+    "scripts": {
+        "dev": "node --watch --import tsx src/index.ts",
+        "start": "node --import tsx src/index.ts",
+        "check": "tsc -p tsconfig.json --noEmit"
+    }
 }

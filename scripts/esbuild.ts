@@ -2,6 +2,7 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import process from 'node:process';
 
 import type { BuildContext, BuildOptions } from 'esbuild';
 import esbuild from 'esbuild';
