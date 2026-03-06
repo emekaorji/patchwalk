@@ -1,8 +1,8 @@
 {
-    "name": "awesome-vscode-extension-boilerplate",
-    "displayName": "Awesome VSCode Extension Boilerplate",
+    "name": "patchwalk",
+    "displayName": "Patchwalk",
     "version": "0.0.29",
-    "description": "An awesome vscode extension boilerplate",
+    "description": "Guided code handoff playback in VS Code with a local MCP endpoint and system TTS",
     "publisher": "YuTengjing",
     "private": true,
     "preview": true,
@@ -22,8 +22,10 @@
         "email": "ytj2713151713@gmail.com"
     },
     "keywords": [
-        "boilerplate",
-        "template"
+        "handoff",
+        "mcp",
+        "narration",
+        "walkthrough"
     ],
     "categories": [
         "Other"
@@ -41,14 +43,44 @@
             "href": "https://github.com/tjx666/awesome-vscode-extension-boilerplate/fork"
         }
     ],
-    "activationEvents": [],
+    "activationEvents": [
+        "onStartupFinished",
+        "onCommand:patchwalk.startMcpServer",
+        "onCommand:patchwalk.stopMcpServer",
+        "onCommand:patchwalk.playFromClipboard"
+    ],
     "contributes": {
         "commands": [
             {
-                "command": "awesome-vscode-extension-boilerplate.helloWorld",
-                "title": "Hello World"
+                "command": "patchwalk.startMcpServer",
+                "title": "Patchwalk: Start MCP Server"
+            },
+            {
+                "command": "patchwalk.stopMcpServer",
+                "title": "Patchwalk: Stop MCP Server"
+            },
+            {
+                "command": "patchwalk.playFromClipboard",
+                "title": "Patchwalk: Play Handoff From Clipboard"
             }
-        ]
+        ],
+        "configuration": {
+            "title": "Patchwalk",
+            "properties": {
+                "patchwalk.autoStartMcpServer": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Automatically start the local Patchwalk MCP server when the extension activates."
+                },
+                "patchwalk.mcpPort": {
+                    "type": "number",
+                    "default": 7357,
+                    "minimum": 1,
+                    "maximum": 65535,
+                    "description": "Local TCP port used by the Patchwalk MCP HTTP endpoint."
+                }
+            }
+        }
     },
     "eslintConfig": {
         "extends": "@yutengjing/eslint-config-typescript",

@@ -1,61 +1,98 @@
-# vscode extension boilerplate
+# Patchwalk
 
-<div align="center">
+Patchwalk is a VS Code extension that replays AI code handoffs.
 
-[![Version](https://img.shields.io/visual-studio-marketplace/v/YuTengjing.awesome-vscode-extension-boilerplate)](https://marketplace.visualstudio.com/items/YuTengjing.awesome-vscode-extension-boilerplate/changelog) [![Installs](https://img.shields.io/visual-studio-marketplace/i/YuTengjing.awesome-vscode-extension-boilerplate)](https://marketplace.visualstudio.com/items?itemName=YuTengjing.awesome-vscode-extension-boilerplate) [![Downloads](https://img.shields.io/visual-studio-marketplace/d/YuTengjing.awesome-vscode-extension-boilerplate)](https://marketplace.visualstudio.com/items?itemName=YuTengjing.awesome-vscode-extension-boilerplate) [![Rating Star](https://img.shields.io/visual-studio-marketplace/stars/YuTengjing.awesome-vscode-extension-boilerplate)](https://marketplace.visualstudio.com/items?itemName=YuTengjing.awesome-vscode-extension-boilerplate&ssr=false#review-details) [![Last Updated](https://img.shields.io/visual-studio-marketplace/last-updated/YuTengjing.awesome-vscode-extension-boilerplate)](https://github.com/tjx666/awesome-vscode-extension-boilerplate)
+It hosts a local MCP-compatible HTTP endpoint. When it receives a valid handoff payload, it:
 
-![CI](https://github.com/tjx666/awesome-vscode-extension-boilerplate/actions/workflows/ci.yml/badge.svg) [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat)](http://makeapullrequest.com) [![Github Open Issues](https://img.shields.io/github/issues/tjx666/awesome-vscode-extension-boilerplate)](https://github.com/tjx666/awesome-vscode-extension-boilerplate/issues) [![LICENSE](https://img.shields.io/badge/license-Anti%20996-blue.svg?style=flat-square)](https://github.com/996icu/996.ICU/blob/master/LICENSE)
+1. Speaks the payload `summary` using the OS default TTS voice.
+2. Loops through `walkthrough` items.
+3. Opens each file in the editor.
+4. Scrolls to `range.startLine`.
+5. Highlights `range.startLine..range.endLine`.
+6. Speaks each step `narration`.
 
-</div>
+## Commands
 
-## Features
+- `Patchwalk: Start MCP Server`
+- `Patchwalk: Stop MCP Server`
+- `Patchwalk: Play Handoff From Clipboard`
 
-- github actions support publish extension to both vs marketplace and open vsx
-- auto generate changelog and publish github release, make sure you enabled the write permission of github actions
-- pnpm/eslint/prettier/ling-staged/simple-git-hooks/stale-dep
-- use esbuild to bundle extension
+## Settings
 
-## Setup
+- `patchwalk.autoStartMcpServer` (default: `true`)
+- `patchwalk.mcpPort` (default: `7357`)
 
-After fork this repository and clone it to local, run:
+## MCP endpoint
 
-```bash
-cd <your-extension-directory>
-npx setup-boilerplate
+- URL: `http://127.0.0.1:<patchwalk.mcpPort>/mcp`
+- Health check: `GET /health`
+- Supported methods: `initialize`, `tools/list`, `tools/call`, `ping`
+- Tool name: `patchwalk.play`
+
+`tools/call` accepts the handoff payload either directly in `params.arguments` or wrapped in `params.arguments.payload`.
+
+## Minimal payload
+
+```json
+{
+  "$schema": "https://patchwalk.dev/schema/handoff-1.0.schema.json",
+  "specVersion": "1.0.0",
+  "handoffId": "8d8f64f2-6f2c-4f91-a7ba-3af2f0ef8d9a",
+  "createdAt": "2026-03-05T09:10:00Z",
+  "producer": { "agent": "codex", "agentVersion": "1.0", "model": "gpt-5" },
+  "summary": "Added refresh flow.",
+  "walkthrough": [
+    {
+      "id": "step-1",
+      "title": "Refresh handler",
+      "narration": "This file adds refresh token validation, rotation, and response shaping.",
+      "path": "src/auth/refresh.ts",
+      "type": "symbol",
+      "symbol": "handleRefresh",
+      "range": { "startLine": 24, "endLine": 92 }
+    }
+  ]
+}
 ```
 
-You can also just skip this step and adjust the boilerplate by yourself.
+## Example tools/call request
+
+```bash
+curl -X POST http://127.0.0.1:7357/mcp \
+  -H 'content-type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "patchwalk.play",
+      "arguments": {
+        "specVersion": "1.0.0",
+        "handoffId": "demo-1",
+        "createdAt": "2026-03-06T00:00:00Z",
+        "producer": { "agent": "codex" },
+        "summary": "Demo walkthrough.",
+        "walkthrough": [
+          {
+            "id": "step-1",
+            "title": "Open file",
+            "narration": "Patchwalk is highlighting this range.",
+            "path": "src/extension.ts",
+            "range": { "startLine": 1, "endLine": 20 }
+          }
+        ]
+      }
+    }
+  }'
+```
+
+Expected result: VS Code focuses the file/range and narrates each step in sequence.
 
 ## Development
 
-Install dependencies by:
-
-```shell
+```bash
 pnpm install
+pnpm esbuild:base
 ```
 
-Then run and debug extension like in [official documentation](https://code.visualstudio.com/api/get-started/your-first-extension)
-
-## Publish
-
-You need set two github actions secrets:
-
-- VS_MARKETPLACE_TOKEN: [Visual Studio Marketplace token](https://learn.microsoft.com/azure/devops/organizations/accounts/use-personal-access-tokens-to-authenticate)
-- OPEN_VSX_TOKEN: [Open VSX Registry token](https://github.com/eclipse/openvsx/wiki/Publishing-Extensions#3-create-an-access-token)
-
-```shell
-pnpm release
-```
-
-## My extensions
-
-- [Open in External App](https://github.com/tjx666/open-in-external-app)
-- [VSCode archive](https://github.com/tjx666/vscode-archive)
-- [Neo File Utils](https://github.com/tjx666/vscode-neo-file-utils)
-- [VSCode FE Helper](https://github.com/tjx666/vscode-fe-helper)
-- [Modify File Warning](https://github.com/tjx666/modify-file-warning)
-- [Power Edit](https://github.com/tjx666/power-edit)
-- [Adobe Extension Development Tools](https://github.com/tjx666/vscode-adobe-extension-devtools)
-- [Scripting Listener](https://github.com/tjx666/scripting-listener)
-
-Check all here: [publishers/YuTengjing](https://marketplace.visualstudio.com/publishers/YuTengjing)
+Run the extension via `F5` in VS Code.
