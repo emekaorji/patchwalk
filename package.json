@@ -99,19 +99,19 @@
         "pre-commit": "npx lint-staged"
     },
     "scripts": {
-        "vscode:prepublish": "pnpm generate:schema && pnpm esbuild:base --minify",
+        "vscode:prepublish": "pnpm esbuild:base --minify",
         "preinstall": "npx only-allow pnpm",
         "postinstall": "stale-dep -u",
         "prepare": "simple-git-hooks",
         "clean": "npx rimraf -rf ./out",
-        "generate:schema": "tsx scripts/generate-schema.ts",
+        "clean:test": "npx rimraf -rf ./out/test",
         "esbuild:base": "stale-dep && tsx scripts/esbuild.ts",
         "esbuild:watch": "pnpm esbuild:base --sourcemap --watch",
         "esbuild:analyze": "pnpm esbuild:base --minify --metafile --analyze && esbuild-visualizer --metadata ./meta.json --open",
-        "compile:test": "pnpm clean && tsc -b ./test/tsconfig.json",
+        "compile:test": "pnpm clean:test && tsc -b ./test/tsconfig.json",
         "lint": "eslint src test scripts --ext ts",
         "play:sample": "tsx scripts/send-sample-handoff.ts",
-        "test": "stale-dep && pnpm generate:schema && pnpm compile:test && node ./out/test/runTests.js",
+        "test": "stale-dep && pnpm compile:test && node ./out/test/runTests.js",
         "package": "vsce package --no-dependencies",
         "release": "npx @yutengjing/release",
         "publish:vs-marketplace": "vsce publish --no-dependencies",
@@ -142,6 +142,7 @@
         "typescript": "~5.5.4"
     },
     "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.27.1",
         "zod": "^4.3.6"
     }
 }

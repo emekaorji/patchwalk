@@ -1,22 +1,16 @@
 import process from 'node:process';
 
-interface JsonRpcSuccessResponse<T> {
-    jsonrpc: '2.0';
-    id: number;
-    result: T;
-}
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
-interface JsonRpcErrorResponse {
-    jsonrpc: '2.0';
-    id: number | null;
-    error: {
-        code: number;
-        message: string;
-        data?: unknown;
-    };
-}
+import {
+    PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
+    PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
+    PATCHWALK_PLAY_TOOL_NAME,
+    PATCHWALK_STATUS_RESOURCE_URI,
+} from '../src/mcpCatalog';
+import type { PatchwalkHandoffPayload } from '../src/schema';
 
-type JsonRpcResponse<T> = JsonRpcSuccessResponse<T> | JsonRpcErrorResponse;
 type WalkthroughTargetType = 'line' | 'range' | 'symbol';
 
 const port = Number(process.env.PATCHWALK_MCP_PORT ?? '7357');
@@ -567,7 +561,7 @@ const walkthrough: SampleWalkthroughStep[] = [
     ),
 ];
 
-const samplePayload = {
+const samplePayload: PatchwalkHandoffPayload = {
     specVersion: '1.0.0',
     handoffId: `sample-demo-${new Date().toISOString()}`,
     createdAt: new Date().toISOString(),
@@ -591,42 +585,67 @@ const fetchJson = async <T>(input: string, init?: RequestInit): Promise<T> => {
     return bodyText ? (JSON.parse(bodyText) as T) : (undefined as T);
 };
 
-const callRpc = async <T>(id: number, method: string, params: unknown): Promise<T> => {
-    const response = await fetchJson<JsonRpcResponse<T>>(endpointUrl, {
-        method: 'POST',
-        headers: {
-            'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-            jsonrpc: '2.0',
-            id,
-            method,
-            params,
-        }),
-    });
-
-    if ('error' in response) {
-        throw new Error(`${response.error.code}: ${response.error.message}`);
-    }
-
-    return response.result;
-};
-
 const main = async (): Promise<void> => {
     const health = await fetchJson<{ ok: boolean }>(`${baseUrl}/health`);
     console.log('health:', health);
 
-    const initializeResult = await callRpc<Record<string, unknown>>(1, 'initialize', {});
-    console.log('initialize:', initializeResult);
-
-    const toolsResult = await callRpc<Record<string, unknown>>(2, 'tools/list', {});
-    console.log('tools/list:', toolsResult);
-
-    const playResult = await callRpc<Record<string, unknown>>(3, 'tools/call', {
-        name: 'patchwalk.play',
-        arguments: samplePayload,
+    const client = new Client({
+        name: 'patchwalk-sample-client',
+        version: '1.0.0',
     });
-    console.log('tools/call:', playResult);
+    const transport = new StreamableHTTPClientTransport(new URL(endpointUrl));
+
+    try {
+        await client.connect(transport);
+
+        console.log('serverInfo:', client.getServerVersion());
+        console.log('capabilities:', client.getServerCapabilities());
+        console.log('sessionId:', transport.sessionId ?? null);
+
+        const resources = await client.listResources();
+        console.log(
+            'resources:',
+            resources.resources.map((resource) => resource.uri),
+        );
+
+        const statusResource = await client.readResource({ uri: PATCHWALK_STATUS_RESOURCE_URI });
+        console.log('status:', statusResource.contents[0]);
+
+        const exampleHandoff = await client.readResource({
+            uri: PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
+        });
+        console.log('example-handoff:', exampleHandoff.contents[0]);
+
+        const prompts = await client.listPrompts();
+        console.log(
+            'prompts:',
+            prompts.prompts.map((prompt) => prompt.name),
+        );
+
+        const composePrompt = await client.getPrompt({
+            name: PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
+            arguments: {
+                changeSummary: 'Walk through the sample workspace in detail.',
+                changedFiles: 'test-workspace/src/**/*',
+                focusAreas: 'Explain the architecture from entrypoint through routes and services.',
+            },
+        });
+        console.log('compose-prompt:', composePrompt.messages[0]);
+
+        const tools = await client.listTools();
+        console.log(
+            'tools:',
+            tools.tools.map((tool) => tool.name),
+        );
+
+        const playResult = await client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: samplePayload,
+        });
+        console.log('play-result:', playResult);
+    } finally {
+        await Promise.allSettled([transport.terminateSession(), transport.close()]);
+    }
 };
 
 main().catch((error: unknown) => {

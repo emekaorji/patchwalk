@@ -1,7 +1,5 @@
 import { z } from 'zod';
 
-export const PATCHWALK_HANDOFF_SCHEMA_URL = 'https://patchwalk.dev/schema/handoff-1.0.schema.json';
-
 const nonEmptyStringPattern = /\S/;
 
 const nonEmptyStringSchema = z
@@ -44,20 +42,15 @@ export const patchwalkWalkthroughStepSchema = z.strictObject({
     range: patchwalkRangeSchema,
 });
 
-export const patchwalkHandoffPayloadSchema = z
-    .strictObject({
-        $schema: nonEmptyStringSchema.optional(),
-        specVersion: nonEmptyStringSchema,
-        handoffId: nonEmptyStringSchema,
-        createdAt: z.iso.datetime({ offset: true }),
-        producer: patchwalkProducerSchema,
-        summary: nonEmptyStringSchema,
-        walkthrough: z.array(patchwalkWalkthroughStepSchema),
-    })
-    .meta({
-        $id: PATCHWALK_HANDOFF_SCHEMA_URL,
-        title: 'Patchwalk handoff payload',
-    });
+export const patchwalkHandoffPayloadSchema = z.strictObject({
+    $schema: nonEmptyStringSchema.optional(),
+    specVersion: nonEmptyStringSchema,
+    handoffId: nonEmptyStringSchema,
+    createdAt: z.iso.datetime({ offset: true }),
+    producer: patchwalkProducerSchema,
+    summary: nonEmptyStringSchema,
+    walkthrough: z.array(patchwalkWalkthroughStepSchema),
+});
 
 export type PatchwalkTargetType = z.infer<typeof patchwalkTargetTypeSchema>;
 export type PatchwalkRange = z.infer<typeof patchwalkRangeSchema>;
@@ -76,58 +69,6 @@ interface PatchwalkValidationFailure {
 }
 
 export type PatchwalkValidationResult = PatchwalkValidationSuccess | PatchwalkValidationFailure;
-
-type JsonPrimitive = boolean | null | number | string;
-type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
-export interface JsonObject {
-    [key: string]: JsonValue;
-}
-
-const toSerializableJson = (value: unknown): JsonValue => {
-    if (
-        value === null ||
-        typeof value === 'boolean' ||
-        typeof value === 'number' ||
-        typeof value === 'string'
-    ) {
-        return value;
-    }
-
-    if (Array.isArray(value)) {
-        return value.map((item) => toSerializableJson(item));
-    }
-
-    if (typeof value === 'object') {
-        const serializableObject: JsonObject = {};
-        for (const [key, nestedValue] of Object.entries(value)) {
-            if (nestedValue !== undefined) {
-                serializableObject[key] = toSerializableJson(nestedValue);
-            }
-        }
-
-        return serializableObject;
-    }
-
-    throw new TypeError('Value is not JSON serializable.');
-};
-
-const toSerializableJsonObject = (value: unknown): JsonObject => {
-    const serializableValue = toSerializableJson(value);
-
-    if (Array.isArray(serializableValue) || serializableValue === null) {
-        throw new TypeError('Expected a JSON object.');
-    }
-
-    if (typeof serializableValue !== 'object') {
-        throw new TypeError('Expected a JSON object.');
-    }
-
-    return serializableValue;
-};
-
-export const patchwalkHandoffJsonSchema = toSerializableJsonObject(
-    z.toJSONSchema(patchwalkHandoffPayloadSchema),
-);
 
 const formatIssuePath = (path: PropertyKey[]): string => {
     return path.reduce<string>((formattedPath, segment) => {

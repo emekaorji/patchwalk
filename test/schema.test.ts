@@ -1,18 +1,10 @@
-import { deepStrictEqual, match, strictEqual } from 'node:assert';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { match, strictEqual } from 'node:assert';
 
-import {
-    PATCHWALK_HANDOFF_SCHEMA_URL,
-    patchwalkHandoffJsonSchema,
-    patchwalkHandoffPayloadSchema,
-    validatePatchwalkPayload,
-} from '../src/schema';
+import { patchwalkHandoffPayloadSchema, validatePatchwalkPayload } from '../src/schema';
 
 describe('patchwalk schema', () => {
     it('accepts a valid handoff payload', () => {
         const payload = {
-            $schema: PATCHWALK_HANDOFF_SCHEMA_URL,
             specVersion: '1.0.0',
             handoffId: 'demo-1',
             createdAt: '2026-03-06T00:00:00Z',
@@ -76,13 +68,6 @@ describe('patchwalk schema', () => {
         if (!result.ok) {
             match(result.error, /endLine/);
         }
-    });
-
-    it('ships a generated schema file that matches the runtime contract', () => {
-        const schemaFilePath = resolve(__dirname, '../../schema/handoff-1.0.schema.json');
-        const fileContents = readFileSync(schemaFilePath, 'utf8');
-
-        deepStrictEqual(JSON.parse(fileContents), patchwalkHandoffJsonSchema);
     });
 
     it('rejects unexpected fields because the zod objects are strict', () => {

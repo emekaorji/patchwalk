@@ -2,6 +2,8 @@
 
 Patchwalk is a VS Code extension that replays AI code handoffs.
 
+The local MCP endpoint is implemented with the official TypeScript SDK and follows the standard MCP lifecycle over Streamable HTTP.
+
 It hosts a local MCP-compatible HTTP endpoint. When it receives a valid handoff payload, it:
 
 1. Speaks the payload `summary` using the OS default TTS voice.
@@ -26,17 +28,31 @@ It hosts a local MCP-compatible HTTP endpoint. When it receives a valid handoff 
 
 - URL: `http://127.0.0.1:<patchwalk.mcpPort>/mcp`
 - Health check: `GET /health`
-- Supported methods: `initialize`, `tools/list`, `tools/call`, `ping`
-- Tool name: `patchwalk.play`
-- Standalone schema file: `schema/handoff-1.0.schema.json`
+- Transport: stateful Streamable HTTP via `@modelcontextprotocol/sdk`
+- Methods handled on the MCP endpoint: `POST`, `GET`, `DELETE`
+- Recommended client path: use an MCP client library instead of hand-rolling JSON-RPC
 
-`tools/call` accepts the handoff payload either directly in `params.arguments` or wrapped in `params.arguments.payload`.
+### Capabilities
+
+Tools:
+
+- `patchwalk.play`
+
+Resources:
+
+- `patchwalk://server/status`
+- `patchwalk://server/operator-manual`
+- `patchwalk://handoff/example`
+
+Prompts:
+
+- `patchwalk.compose-handoff`
+- `patchwalk.expand-walkthrough`
 
 ## Minimal payload
 
 ```json
 {
-  "$schema": "https://patchwalk.dev/schema/handoff-1.0.schema.json",
   "specVersion": "1.0.0",
   "handoffId": "8d8f64f2-6f2c-4f91-a7ba-3af2f0ef8d9a",
   "createdAt": "2026-03-05T09:10:00Z",
@@ -56,44 +72,28 @@ It hosts a local MCP-compatible HTTP endpoint. When it receives a valid handoff 
 }
 ```
 
-## Example tools/call request
+## Sample client
+
+For a full end-to-end sample client, run:
 
 ```bash
-curl -X POST http://127.0.0.1:7357/mcp \
-  -H 'content-type: application/json' \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "tools/call",
-    "params": {
-      "name": "patchwalk.play",
-      "arguments": {
-        "specVersion": "1.0.0",
-        "handoffId": "demo-1",
-        "createdAt": "2026-03-06T00:00:00Z",
-        "producer": { "agent": "codex" },
-        "summary": "Demo walkthrough.",
-        "walkthrough": [
-          {
-            "id": "step-1",
-            "title": "Open file",
-            "narration": "Patchwalk is highlighting this range.",
-            "path": "src/extension.ts",
-            "range": { "startLine": 1, "endLine": 20 }
-          }
-        ]
-      }
-    }
-  }'
+pnpm play:sample
 ```
 
-Expected result: VS Code focuses the file/range and narrates each step in sequence.
+That script:
+
+1. Connects with the official MCP client transport
+2. Reads the status and example resources
+3. Fetches a prompt template
+4. Lists tools
+5. Calls `patchwalk.play`
+
+Expected result: VS Code focuses the file/range and narrates each step in sequence while the client receives a normal MCP tool result.
 
 ## Development
 
 ```bash
 pnpm install
-pnpm generate:schema
 pnpm esbuild:base
 ```
 
