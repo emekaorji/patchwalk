@@ -1,7 +1,7 @@
 {
     "name": "patchwalk",
     "displayName": "Patchwalk",
-    "version": "0.0.29",
+    "version": "0.0.30",
     "description": "Guided code handoff playback in VS Code with a local MCP endpoint and system TTS",
     "publisher": "YuTengjing",
     "private": true,
