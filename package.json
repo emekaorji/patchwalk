@@ -3,23 +3,23 @@
     "displayName": "Patchwalk",
     "version": "0.0.31",
     "description": "Guided code handoff playback in VS Code with a local MCP endpoint and system TTS",
-    "publisher": "YuTengjing",
+    "publisher": "coderabbi",
     "private": true,
     "preview": true,
     "author": {
-        "name": "YuTengjing",
-        "email": "ytj2713151713@gmail.com",
-        "url": "https://github.com/tjx666"
+        "name": "emekaorji",
+        "email": "emekapraiseo@gmail.com",
+        "url": "https://github.com/emekaorji"
     },
     "license": "SEE LICENSE IN LICENSE",
-    "homepage": "https://github.com/tjx666/awesome-vscode-extension-boilerplate/blob/master/README.md",
+    "homepage": "https://github.com/emekaorji/patchwalk/blob/master/README.md",
     "repository": {
         "type": "git",
-        "url": "https://github.com/tjx666/awesome-vscode-extension-boilerplate"
+        "url": "https://github.com/emekaorji/patchwalk"
     },
     "bugs": {
-        "url": "https://github.com/tjx666/awesome-vscode-extension-boilerplate/issues",
-        "email": "ytj2713151713@gmail.com"
+        "url": "https://github.com/emekaorji/patchwalk/issues",
+        "email": "emekapraiseo@gmail.com"
     },
     "keywords": [
         "handoff",
@@ -40,14 +40,11 @@
         {
             "url": "https://img.shields.io/badge/PRs-welcome-brightgreen.svg",
             "description": "PRs Welcome",
-            "href": "https://github.com/tjx666/awesome-vscode-extension-boilerplate/fork"
+            "href": "https://github.com/emekaorji/patchwalk/fork"
         }
     ],
     "activationEvents": [
-        "onStartupFinished",
-        "onCommand:patchwalk.startMcpServer",
-        "onCommand:patchwalk.stopMcpServer",
-        "onCommand:patchwalk.playFromClipboard"
+        "onStartupFinished"
     ],
     "contributes": {
         "commands": [
