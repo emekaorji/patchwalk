@@ -119,7 +119,7 @@ export class PatchwalkMcpServer {
         }
 
         this.server = createServer(async (request, response) => {
-            await this.handleHttpRequest(request, response);
+            await this.handleHttpRequestSafely(request, response);
         });
 
         await new Promise<void>((resolve, reject) => {
@@ -160,6 +160,33 @@ export class PatchwalkMcpServer {
 
         this.server = undefined;
         this.startedAt = null;
+    }
+
+    private async handleHttpRequestSafely(
+        request: IncomingMessage,
+        response: ServerResponse,
+    ): Promise<void> {
+        try {
+            await this.handleHttpRequest(request, response);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.options.outputChannel.appendLine(
+                `Patchwalk MCP request ${request.method ?? 'UNKNOWN'} ${getRequestPath(request)} failed: ${message}`,
+            );
+
+            if (!response.headersSent) {
+                this.writeJsonResponse(
+                    response,
+                    500,
+                    createJsonRpcErrorResponse(-32603, 'Internal server error'),
+                );
+                return;
+            }
+
+            if (!response.writableEnded) {
+                response.end();
+            }
+        }
     }
 
     private async handleHttpRequest(
@@ -250,6 +277,11 @@ export class PatchwalkMcpServer {
         const session = await this.createSession();
         session.requestCount += 1;
         await this.forwardToTransport(session, request, response, parsedBody);
+
+        // A failed initialize request can exit before the transport assigns a session id.
+        if (!session.id) {
+            await this.disposeOrphanedSession(session);
+        }
     }
 
     private async handleSessionBoundRequest(
@@ -606,11 +638,34 @@ export class PatchwalkMcpServer {
             return;
         }
 
+        await this.closeSession(session);
+    }
+
+    private async disposeOrphanedSession(session: PatchwalkMcpSession): Promise<void> {
+        if (session.disposed || session.id) {
+            return;
+        }
+
+        this.options.outputChannel.appendLine(
+            'Patchwalk MCP session failed before a session ID was assigned. Cleaning up orphaned session.',
+        );
+        await this.closeSession(session);
+    }
+
+    private async closeSession(session: PatchwalkMcpSession): Promise<void> {
+        if (session.disposed) {
+            return;
+        }
+
         session.disposed = true;
-        this.sessions.delete(sessionId);
+        if (session.id) {
+            this.sessions.delete(session.id);
+        }
 
         await Promise.allSettled([session.transport.close(), session.server.close()]);
-        this.options.outputChannel.appendLine(`Patchwalk MCP session stopped: ${sessionId}`);
+        this.options.outputChannel.appendLine(
+            `Patchwalk MCP session stopped: ${session.id || '<pending>'}`,
+        );
     }
 
     private async readJsonBody(request: IncomingMessage): Promise<unknown> {

@@ -2,6 +2,7 @@ import { deepStrictEqual, match, ok, strictEqual } from 'node:assert';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js';
 import type * as vscode from 'vscode';
 
 import type { PatchwalkStatusResource } from '../src/mcpCatalog';
@@ -50,6 +51,44 @@ const readTextResource = async (client: Client, uri: string): Promise<string> =>
     }
 
     return firstContent.text;
+};
+
+const createInitializeRequest = () => {
+    return {
+        jsonrpc: '2.0' as const,
+        id: 'initialize-test',
+        method: 'initialize' as const,
+        params: {
+            protocolVersion: LATEST_PROTOCOL_VERSION,
+            capabilities: {},
+            clientInfo: {
+                name: 'patchwalk-raw-http-test',
+                version: '1.0.0',
+            },
+        },
+    };
+};
+
+const postJson = async (url: string, body: unknown): Promise<Response> => {
+    return fetch(url, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+        },
+        body: JSON.stringify(body),
+    });
+};
+
+const assertInternalServerErrorResponse = async (response: Response): Promise<void> => {
+    strictEqual(response.status, 500);
+    deepStrictEqual(await response.json(), {
+        jsonrpc: '2.0',
+        id: null,
+        error: {
+            code: -32603,
+            message: 'Internal server error',
+        },
+    });
 };
 
 const createOutputChannelStub = (): vscode.OutputChannel => {
@@ -190,6 +229,26 @@ describe('patchwalk mcp server', () => {
         strictEqual(content[0].text, `Patchwalk playback completed for ${payload.handoffId}.`);
     });
 
+    it('rejects empty walkthroughs before playback starts', async () => {
+        const playResult = await client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: {
+                ...createPayload(),
+                handoffId: 'empty-walkthrough',
+                walkthrough: [],
+            },
+        });
+        const content = playResult.content as Array<{ type: string; text?: string }>;
+
+        strictEqual(playbackRequests.length, 0);
+        strictEqual(playResult.isError, true);
+        strictEqual(content[0]?.type, 'text');
+        if (content[0]?.type !== 'text') {
+            throw new Error('Expected text tool content.');
+        }
+        match(content[0].text ?? '', /Input validation error/);
+    });
+
     it('keeps backward compatibility for the legacy payload wrapper', async () => {
         const payload = createPayload();
         const playResult = await client.callTool({
@@ -207,5 +266,69 @@ describe('patchwalk mcp server', () => {
         strictEqual(playbackRequests.length, 1);
         deepStrictEqual(playbackRequests[0], payload);
         strictEqual(structuredContent?.handoffId, payload.handoffId);
+    });
+
+    it('returns an HTTP 500 when session creation fails before request handling begins', async () => {
+        const serverWithInternals = server as unknown as {
+            createSession: () => Promise<never>;
+        };
+
+        serverWithInternals.createSession = async () => {
+            throw new Error('session init exploded');
+        };
+
+        const response = await postJson(endpointUrl, createInitializeRequest());
+
+        await assertInternalServerErrorResponse(response);
+        strictEqual(server.activeSessionCount, 1);
+    });
+
+    it('cleans up orphaned sessions when the initial MCP request fails', async () => {
+        const closed: string[] = [];
+        const serverWithInternals = server as unknown as {
+            createSession: () => Promise<{
+                id: string;
+                createdAt: string;
+                requestCount: number;
+                disposed: boolean;
+                server: { close: () => Promise<void> };
+                transport: {
+                    close: () => Promise<void>;
+                    handleRequest: (
+                        request: unknown,
+                        response: unknown,
+                        parsedBody?: unknown,
+                    ) => Promise<void>;
+                };
+            }>;
+        };
+
+        serverWithInternals.createSession = async () => {
+            return {
+                id: '',
+                createdAt: new Date().toISOString(),
+                requestCount: 0,
+                disposed: false,
+                server: {
+                    close: async () => {
+                        closed.push('server');
+                    },
+                },
+                transport: {
+                    close: async () => {
+                        closed.push('transport');
+                    },
+                    handleRequest: async () => {
+                        throw new Error('transport failure');
+                    },
+                },
+            };
+        };
+
+        const response = await postJson(endpointUrl, createInitializeRequest());
+
+        await assertInternalServerErrorResponse(response);
+        deepStrictEqual(closed.sort(), ['server', 'transport']);
+        strictEqual(server.activeSessionCount, 1);
     });
 });

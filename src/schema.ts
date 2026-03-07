@@ -49,7 +49,7 @@ export const patchwalkHandoffPayloadSchema = z.strictObject({
     createdAt: z.iso.datetime({ offset: true }),
     producer: patchwalkProducerSchema,
     summary: nonEmptyStringSchema,
-    walkthrough: z.array(patchwalkWalkthroughStepSchema),
+    walkthrough: z.array(patchwalkWalkthroughStepSchema).min(1, 'must contain at least one step.'),
 });
 
 export type PatchwalkTargetType = z.infer<typeof patchwalkTargetTypeSchema>;
