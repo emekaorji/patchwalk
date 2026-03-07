@@ -2,7 +2,7 @@
     "name": "patchwalk",
     "displayName": "Patchwalk",
     "version": "0.0.31",
-    "description": "Guided code handoff playback in VS Code with a local MCP endpoint and system TTS",
+    "description": "Post-patch agentic handoff",
     "publisher": "coderabbi",
     "private": true,
     "preview": true,
