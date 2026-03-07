@@ -1,14 +1,34 @@
 import * as vscode from 'vscode';
 
-import { PatchwalkMcpServer } from './mcpServer';
 import { PatchwalkPlaybackRunner } from './playback';
 import { validatePatchwalkPayload } from './schema';
+import { PatchwalkWorkerController } from './workerController';
+
+/**
+ * The extension process is now a worker and UI shell. It no longer hosts MCP directly; instead it
+ * keeps one local daemon healthy and executes playback only when the daemon routes a handoff to
+ * this window.
+ */
+function readDaemonPort(): number {
+    const configuration = vscode.workspace.getConfiguration('patchwalk');
+    return configuration.get<number>('daemonPort', configuration.get<number>('mcpPort', 7357));
+}
 
 export function activate(context: vscode.ExtensionContext) {
     const outputChannel = vscode.window.createOutputChannel('Patchwalk');
     const playbackRunner = new PatchwalkPlaybackRunner(outputChannel);
-    let mcpServer: PatchwalkMcpServer | undefined;
+    const daemonPort = readDaemonPort();
+    const workerController = new PatchwalkWorkerController({
+        context,
+        daemonPort,
+        outputChannel,
+        playbackRunner,
+    });
 
+    /**
+     * Extension activation should stay resilient: command registration should survive background
+     * failures so the user can still inspect and recover the daemon.
+     */
     const runInBackground = (promise: Promise<unknown>, contextMessage: string): void => {
         promise.catch((error) => {
             const message = error instanceof Error ? error.message : String(error);
@@ -16,62 +36,25 @@ export function activate(context: vscode.ExtensionContext) {
         });
     };
 
-    const startServer = async () => {
-        if (mcpServer) {
-            return;
-        }
-
-        const port = vscode.workspace.getConfiguration('patchwalk').get<number>('mcpPort', 7357);
-        mcpServer = new PatchwalkMcpServer({
-            port,
-            outputChannel,
-            onPlayPayload: async (payload) => {
-                await playbackRunner.play(payload);
-            },
-        });
-
-        try {
-            await mcpServer.start();
-            outputChannel.appendLine(
-                `Patchwalk MCP server listening on http://127.0.0.1:${port}/mcp`,
-            );
-            await vscode.window.showInformationMessage(
-                `Patchwalk MCP server started on port ${port}.`,
-            );
-        } catch (error) {
-            mcpServer = undefined;
-            const message = error instanceof Error ? error.message : String(error);
-            outputChannel.appendLine(`Failed to start MCP server: ${message}`);
-            await vscode.window.showErrorMessage(
-                `Patchwalk MCP server failed to start: ${message}`,
-            );
-        }
-    };
-
-    const stopServer = async () => {
-        if (!mcpServer) {
-            return;
-        }
-
-        await mcpServer.stop();
-        mcpServer = undefined;
-        outputChannel.appendLine('Patchwalk MCP server stopped.');
-        await vscode.window.showInformationMessage('Patchwalk MCP server stopped.');
-    };
-
-    const startServerCommand = vscode.commands.registerCommand(
-        'patchwalk.startMcpServer',
+    const restartDaemonCommand = vscode.commands.registerCommand(
+        'patchwalk.restartDaemon',
         async () => {
-            await startServer();
+            await workerController.restartDaemon();
+            await vscode.window.showInformationMessage('Patchwalk daemon restarted.');
         },
     );
 
-    const stopServerCommand = vscode.commands.registerCommand(
-        'patchwalk.stopMcpServer',
+    const showDaemonStatusCommand = vscode.commands.registerCommand(
+        'patchwalk.showDaemonStatus',
         async () => {
-            await stopServer();
+            await workerController.showStatus();
         },
     );
+
+    const stopDaemonCommand = vscode.commands.registerCommand('patchwalk.stopDaemon', async () => {
+        await workerController.stopDaemon();
+        await vscode.window.showInformationMessage('Patchwalk daemon stopped.');
+    });
 
     const playFromClipboardCommand = vscode.commands.registerCommand(
         'patchwalk.playFromClipboard',
@@ -98,31 +81,21 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            await playbackRunner.play(validation.value);
+            await workerController.routeClipboardPlayback(validation.value);
         },
     );
 
     context.subscriptions.push(
         outputChannel,
         playbackRunner,
-        startServerCommand,
-        stopServerCommand,
+        workerController,
+        restartDaemonCommand,
+        showDaemonStatusCommand,
+        stopDaemonCommand,
         playFromClipboardCommand,
-        {
-            dispose: () => {
-                if (mcpServer) {
-                    runInBackground(stopServer(), 'Failed to stop MCP server during dispose');
-                }
-            },
-        },
     );
 
-    const shouldAutoStart = vscode.workspace
-        .getConfiguration('patchwalk')
-        .get<boolean>('autoStartMcpServer', true);
-    if (shouldAutoStart) {
-        runInBackground(startServer(), 'Failed to auto-start MCP server');
-    }
+    runInBackground(workerController.start(), 'Failed to start Patchwalk worker');
 }
 
 export function deactivate() {

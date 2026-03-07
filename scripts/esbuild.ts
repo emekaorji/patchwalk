@@ -7,11 +7,15 @@ import process from 'node:process';
 import type { BuildContext, BuildOptions } from 'esbuild';
 import esbuild from 'esbuild';
 
+/**
+ * Bundle the extension host entrypoint and the standalone daemon entrypoint together so the
+ * marketplace package ships one installable artifact.
+ */
 const isWatchMode = process.argv.includes('--watch');
 const options: BuildOptions = {
     color: true,
     logLevel: 'info',
-    entryPoints: ['src/extension.ts'],
+    entryPoints: ['src/extension.ts', 'src/daemon.ts'],
     bundle: true,
     metafile: process.argv.includes('--metafile'),
     outdir: './out/src',
@@ -29,6 +33,7 @@ const options: BuildOptions = {
         {
             name: 'umd2esm',
             setup(build) {
+                // Prefer ESM variants for dependencies that resolve more cleanly under esbuild.
                 build.onResolve({ filter: /^(vscode-.*|estree-walker|jsonc-parser)/ }, (args) => {
                     const pathUmdMay = require.resolve(args.path, {
                         paths: [args.resolveDir],
@@ -44,6 +49,7 @@ const options: BuildOptions = {
         {
             name: 'meta',
             setup(build) {
+                // Emit bundle metadata on demand so size regressions can be inspected later.
                 build.onEnd(async (result) => {
                     if (result.metafile && result.errors.length === 0) {
                         return fs.writeFile(
@@ -61,6 +67,7 @@ async function main() {
     let ctx: BuildContext | undefined;
     try {
         if (isWatchMode) {
+            // Watch mode keeps one incremental context around for fast local iteration.
             ctx = await esbuild.context(options);
             await ctx.watch();
         } else {

@@ -1,12 +1,15 @@
 import { deepStrictEqual, match, ok, strictEqual } from 'node:assert';
+import { randomUUID } from 'node:crypto';
+import process from 'node:process';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js';
-import type * as vscode from 'vscode';
 
+import { PATCHWALK_WORKER_API_VERSION } from '../src/controlProtocol';
+import { PatchwalkDaemonClient } from '../src/daemonClient';
 import type { PatchwalkStatusResource } from '../src/mcpCatalog';
 import {
+    PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
     PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
     PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
     PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME,
@@ -15,13 +18,126 @@ import {
     PATCHWALK_STATUS_RESOURCE_URI,
 } from '../src/mcpCatalog';
 import { PatchwalkMcpServer } from '../src/mcpServer';
+import { matchBasePathToWorkspaceRoots } from '../src/routing';
 import type { PatchwalkHandoffPayload } from '../src/schema';
 
-const createPayload = (): PatchwalkHandoffPayload => {
+// Health checks come from the daemon side-channel endpoint rather than MCP resources.
+interface PatchwalkHealthResponse {
+    ok: boolean;
+    endpointUrl: string | null;
+    daemonPid: number;
+    activeSessionCount: number;
+    workerCount: number;
+    activeDispatchCount: number;
+}
+
+/**
+ * The fake worker speaks the same private daemon protocol as the real extension window, but strips
+ * out editor integration so the daemon can be tested deterministically in-process.
+ */
+class FakePatchwalkWorker {
+    public readonly workerId = randomUUID();
+    public readonly executedPayloads: PatchwalkHandoffPayload[] = [];
+    private stopped = false;
+    private pollPromise: Promise<void> | undefined;
+
+    public constructor(
+        private readonly daemonClient: PatchwalkDaemonClient,
+        private readonly workspaceRoots: string[],
+        private readonly extensionVersion = 'test-extension',
+    ) {}
+
+    public async start(options: { lastSeenAt?: string } = {}): Promise<void> {
+        await this.daemonClient.registerWorker({
+            workerId: this.workerId,
+            processId: process.pid,
+            extensionVersion: this.extensionVersion,
+            workspaceRoots: this.workspaceRoots,
+            lastSeenAt: options.lastSeenAt ?? new Date().toISOString(),
+            apiVersion: PATCHWALK_WORKER_API_VERSION,
+        });
+
+        this.pollPromise = this.poll();
+    }
+
+    public async stop(): Promise<void> {
+        this.stopped = true;
+        await Promise.race([
+            this.pollPromise ?? Promise.resolve(),
+            new Promise((resolve) => {
+                setTimeout(resolve, 700);
+            }),
+        ]);
+    }
+
+    private async poll(): Promise<void> {
+        if (this.stopped) {
+            return;
+        }
+
+        try {
+            const events = await this.daemonClient.pollEvents(this.workerId, 500);
+            // Preserve event order so claim/execute semantics match the real worker loop.
+            await events.reduce<Promise<void>>(async (queue, event) => {
+                await queue;
+
+                switch (event.type) {
+                    case 'playback.claim': {
+                        const matchForWorker = matchBasePathToWorkspaceRoots(
+                            event.basePath,
+                            this.workspaceRoots,
+                        );
+                        if (!matchForWorker) {
+                            await this.daemonClient.submitClaim(this.workerId, {
+                                dispatchId: event.dispatchId,
+                                accepted: false,
+                            });
+                            return;
+                        }
+
+                        await this.daemonClient.submitClaim(this.workerId, {
+                            dispatchId: event.dispatchId,
+                            accepted: true,
+                            matchedRoot: matchForWorker.matchedRoot,
+                            matchKind: matchForWorker.matchKind,
+                        });
+                        return;
+                    }
+                    case 'playback.execute':
+                        this.executedPayloads.push(event.payload);
+                        await this.daemonClient.submitResult(this.workerId, {
+                            dispatchId: event.dispatchId,
+                            handoffId: event.payload.handoffId,
+                            status: 'completed',
+                            stepsPlayed: event.payload.walkthrough.length,
+                        });
+                        return;
+                    case 'playback.cancel':
+                    case 'worker.reconcile':
+                        return;
+                }
+            }, Promise.resolve());
+        } catch (error) {
+            if (!this.stopped) {
+                throw error;
+            }
+        }
+
+        if (!this.stopped) {
+            await this.poll();
+        }
+    }
+}
+
+/**
+ * Keep routing payloads intentionally small so each test isolates one daemon behavior.
+ */
+const createPayload = (basePath: string): PatchwalkHandoffPayload => {
     return {
         specVersion: '1.0.0',
-        handoffId: 'mcp-server-test',
+        handoffId: `mcp-server-test-${randomUUID()}`,
         createdAt: '2026-03-07T10:00:00Z',
+        basePath,
         producer: {
             agent: 'codex',
             model: 'gpt-5',
@@ -53,74 +169,18 @@ const readTextResource = async (client: Client, uri: string): Promise<string> =>
     return firstContent.text;
 };
 
-const createInitializeRequest = () => {
-    return {
-        jsonrpc: '2.0' as const,
-        id: 'initialize-test',
-        method: 'initialize' as const,
-        params: {
-            protocolVersion: LATEST_PROTOCOL_VERSION,
-            capabilities: {},
-            clientInfo: {
-                name: 'patchwalk-raw-http-test',
-                version: '1.0.0',
-            },
-        },
-    };
-};
-
-const postJson = async (url: string, body: unknown): Promise<Response> => {
-    return fetch(url, {
-        method: 'POST',
-        headers: {
-            'content-type': 'application/json',
-        },
-        body: JSON.stringify(body),
-    });
-};
-
-const assertInternalServerErrorResponse = async (response: Response): Promise<void> => {
-    strictEqual(response.status, 500);
-    deepStrictEqual(await response.json(), {
-        jsonrpc: '2.0',
-        id: null,
-        error: {
-            code: -32603,
-            message: 'Internal server error',
-        },
-    });
-};
-
-const createOutputChannelStub = (): vscode.OutputChannel => {
-    return {
-        name: 'Patchwalk MCP Test',
-        append: () => {},
-        appendLine: () => {},
-        clear: () => {},
-        show: () => {},
-        hide: () => {},
-        replace: () => {},
-        dispose: () => {},
-    };
-};
-
+// These integration tests exercise the daemon end to end: HTTP, MCP, and worker routing.
 describe('patchwalk mcp server', () => {
-    let outputChannel: vscode.OutputChannel;
-    let playbackRequests: PatchwalkHandoffPayload[];
     let server: PatchwalkMcpServer;
     let endpointUrl: string;
     let client: Client;
     let transport: StreamableHTTPClientTransport;
+    let daemonClient: PatchwalkDaemonClient;
+    let workers: FakePatchwalkWorker[];
 
     beforeEach(async () => {
-        outputChannel = createOutputChannelStub();
-        playbackRequests = [];
         server = new PatchwalkMcpServer({
             port: 0,
-            outputChannel,
-            onPlayPayload: async (payload) => {
-                playbackRequests.push(payload);
-            },
         });
 
         await server.start();
@@ -133,47 +193,38 @@ describe('patchwalk mcp server', () => {
         });
         transport = new StreamableHTTPClientTransport(new URL(endpointUrl));
         await client.connect(transport);
+
+        daemonClient = new PatchwalkDaemonClient({
+            daemonEntryPath: '/unused/in-tests',
+            port: server.listeningPort!,
+        });
+        workers = [];
     });
 
     afterEach(async () => {
+        await Promise.allSettled(workers.map(async (worker) => worker.stop()));
         await Promise.allSettled([transport.terminateSession(), transport.close(), server.stop()]);
-        outputChannel.dispose();
     });
 
-    it('serves health checks on the side channel endpoint', async () => {
+    it('serves health checks and MCP capabilities from the daemon', async () => {
         const healthUrl = endpointUrl.replace(/\/mcp$/, '/health');
         const response = await fetch(healthUrl);
+        const health = (await response.json()) as PatchwalkHealthResponse;
 
         strictEqual(response.status, 200);
-        deepStrictEqual(await response.json(), {
-            ok: true,
-            endpointUrl,
-            activeSessionCount: 1,
-        });
-    });
-
-    it('exposes resources, prompts, and tools through the MCP client', async () => {
-        ok(transport.sessionId, 'Expected the MCP transport to negotiate a session ID.');
+        strictEqual(health.ok, true);
+        strictEqual(health.endpointUrl, endpointUrl);
+        strictEqual(health.activeSessionCount, 1);
+        strictEqual(health.daemonPid > 0, true);
 
         const resources = await client.listResources();
-        const resourceUris = resources.resources.map((resource) => resource.uri);
-        deepStrictEqual(resourceUris.sort(), [
+        const resourceUris = resources.resources.map((resource) => resource.uri).sort();
+        deepStrictEqual(resourceUris, [
+            PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
             PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
             PATCHWALK_OPERATOR_MANUAL_RESOURCE_URI,
             PATCHWALK_STATUS_RESOURCE_URI,
         ]);
-
-        const statusResource = JSON.parse(
-            await readTextResource(client, PATCHWALK_STATUS_RESOURCE_URI),
-        ) as PatchwalkStatusResource;
-        strictEqual(statusResource.endpointUrl, endpointUrl);
-        strictEqual(statusResource.activeSessionCount, 1);
-        deepStrictEqual(statusResource.tools, [PATCHWALK_PLAY_TOOL_NAME]);
-
-        const exampleHandoff = JSON.parse(
-            await readTextResource(client, PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI),
-        ) as PatchwalkHandoffPayload;
-        strictEqual(exampleHandoff.handoffId, 'patchwalk-example-handoff');
 
         const prompts = await client.listPrompts();
         const promptNames = prompts.prompts.map((prompt) => prompt.name).sort();
@@ -182,28 +233,42 @@ describe('patchwalk mcp server', () => {
             PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME,
         ]);
 
-        const composePrompt = await client.getPrompt({
-            name: PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
-            arguments: {
-                changeSummary: 'Rewrite the local MCP server.',
-                changedFiles: 'src/mcpServer.ts\nREADME.md',
-            },
-        });
-        strictEqual(composePrompt.messages[0]?.role, 'user');
-        if (composePrompt.messages[0]?.content.type !== 'text') {
-            throw new Error('Expected text prompt content.');
-        }
-        match(composePrompt.messages[0].content.text, /Patchwalk handoff JSON payload/);
-
         const tools = await client.listTools();
         strictEqual(
             tools.tools.some((tool) => tool.name === PATCHWALK_PLAY_TOOL_NAME),
             true,
         );
+
+        const playTool = tools.tools.find((tool) => tool.name === PATCHWALK_PLAY_TOOL_NAME);
+        match(playTool?.description ?? '', /semantic patch explanations/);
     });
 
-    it('plays a handoff payload through the official MCP tool flow', async () => {
-        const payload = createPayload();
+    it('reports worker and dispatch status through the status resource', async () => {
+        const projectRoot = '/tmp/patchwalk-project';
+        const worker = new FakePatchwalkWorker(daemonClient, [projectRoot]);
+        workers.push(worker);
+        await worker.start();
+
+        const statusResource = JSON.parse(
+            await readTextResource(client, PATCHWALK_STATUS_RESOURCE_URI),
+        ) as PatchwalkStatusResource;
+
+        strictEqual((statusResource.daemonPid ?? 0) > 0, true);
+        strictEqual(statusResource.configuredPort, server.listeningPort);
+        strictEqual(statusResource.workerCount, 1);
+        strictEqual(statusResource.activeDispatchCount, 0);
+        deepStrictEqual(statusResource.workers[0]?.workspaceRoots, [projectRoot]);
+    });
+
+    it('routes playback to the exact matching worker', async () => {
+        const parentWorker = new FakePatchwalkWorker(daemonClient, ['/tmp']);
+        const exactWorker = new FakePatchwalkWorker(daemonClient, ['/tmp/patchwalk-project']);
+        workers.push(parentWorker, exactWorker);
+
+        await parentWorker.start();
+        await exactWorker.start();
+
+        const payload = createPayload('/tmp/patchwalk-project');
         const playResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
             arguments: payload,
@@ -213,122 +278,133 @@ describe('patchwalk mcp server', () => {
                   handoffId?: string;
                   status?: string;
                   stepsPlayed?: number;
+                  workerId?: string;
+                  matchedRoot?: string;
               }
             | undefined;
-        const content = playResult.content as Array<{ type: string; text?: string }>;
 
-        strictEqual(playbackRequests.length, 1);
-        deepStrictEqual(playbackRequests[0], payload);
-        strictEqual(structuredContent?.handoffId, payload.handoffId);
+        strictEqual(playResult.isError ?? false, false);
+        strictEqual(parentWorker.executedPayloads.length, 0);
+        strictEqual(exactWorker.executedPayloads.length, 1);
         strictEqual(structuredContent?.status, 'completed');
-        strictEqual(structuredContent?.stepsPlayed, payload.walkthrough.length);
-        strictEqual(content[0]?.type, 'text');
-        if (content[0]?.type !== 'text') {
-            throw new Error('Expected text tool content.');
-        }
-        strictEqual(content[0].text, `Patchwalk playback completed for ${payload.handoffId}.`);
+        strictEqual(structuredContent?.workerId, exactWorker.workerId);
+        strictEqual(structuredContent?.matchedRoot, '/tmp/patchwalk-project');
     });
 
-    it('rejects empty walkthroughs before playback starts', async () => {
+    it('uses the deepest parent-path match when no exact worker exists', async () => {
+        const shallowWorker = new FakePatchwalkWorker(daemonClient, ['/tmp/patchwalk']);
+        const deepWorker = new FakePatchwalkWorker(daemonClient, ['/tmp/patchwalk/project']);
+        workers.push(shallowWorker, deepWorker);
+
+        await shallowWorker.start();
+        await deepWorker.start();
+
         const playResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: {
-                ...createPayload(),
-                handoffId: 'empty-walkthrough',
-                walkthrough: [],
-            },
-        });
-        const content = playResult.content as Array<{ type: string; text?: string }>;
-
-        strictEqual(playbackRequests.length, 0);
-        strictEqual(playResult.isError, true);
-        strictEqual(content[0]?.type, 'text');
-        if (content[0]?.type !== 'text') {
-            throw new Error('Expected text tool content.');
-        }
-        match(content[0].text ?? '', /Input validation error/);
-    });
-
-    it('keeps backward compatibility for the legacy payload wrapper', async () => {
-        const payload = createPayload();
-        const playResult = await client.callTool({
-            name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: {
-                payload,
-            },
+            arguments: createPayload('/tmp/patchwalk/project/service'),
         });
         const structuredContent = playResult.structuredContent as
             | {
-                  handoffId?: string;
+                  workerId?: string;
+                  matchedRoot?: string;
               }
             | undefined;
 
-        strictEqual(playbackRequests.length, 1);
-        deepStrictEqual(playbackRequests[0], payload);
-        strictEqual(structuredContent?.handoffId, payload.handoffId);
+        strictEqual(playResult.isError ?? false, false);
+        strictEqual(shallowWorker.executedPayloads.length, 0);
+        strictEqual(deepWorker.executedPayloads.length, 1);
+        strictEqual(structuredContent?.workerId, deepWorker.workerId);
+        strictEqual(structuredContent?.matchedRoot, '/tmp/patchwalk/project');
     });
 
-    it('returns an HTTP 500 when session creation fails before request handling begins', async () => {
-        const serverWithInternals = server as unknown as {
-            createSession: () => Promise<never>;
-        };
+    it('uses earliest registration as the final tie-breaker', async () => {
+        const firstWorker = new FakePatchwalkWorker(daemonClient, ['/tmp/shared-root']);
+        const secondWorker = new FakePatchwalkWorker(daemonClient, ['/tmp/shared-root']);
+        workers.push(firstWorker, secondWorker);
 
-        serverWithInternals.createSession = async () => {
-            throw new Error('session init exploded');
-        };
+        await firstWorker.start();
+        await secondWorker.start();
 
-        const response = await postJson(endpointUrl, createInitializeRequest());
+        const playResult = await client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: createPayload('/tmp/shared-root/project'),
+        });
+        const structuredContent = playResult.structuredContent as
+            | {
+                  workerId?: string;
+              }
+            | undefined;
 
-        await assertInternalServerErrorResponse(response);
-        strictEqual(server.activeSessionCount, 1);
+        strictEqual(playResult.isError ?? false, false);
+        strictEqual(firstWorker.executedPayloads.length, 1);
+        strictEqual(secondWorker.executedPayloads.length, 0);
+        strictEqual(structuredContent?.workerId, firstWorker.workerId);
     });
 
-    it('cleans up orphaned sessions when the initial MCP request fails', async () => {
-        const closed: string[] = [];
-        const serverWithInternals = server as unknown as {
-            createSession: () => Promise<{
-                id: string;
-                createdAt: string;
-                requestCount: number;
-                disposed: boolean;
-                server: { close: () => Promise<void> };
-                transport: {
-                    close: () => Promise<void>;
-                    handleRequest: (
-                        request: unknown,
-                        response: unknown,
-                        parsedBody?: unknown,
-                    ) => Promise<void>;
-                };
-            }>;
-        };
+    it('returns a tool error when no live worker matches the base path', async () => {
+        const worker = new FakePatchwalkWorker(daemonClient, ['/tmp/unrelated-root']);
+        workers.push(worker);
+        await worker.start();
 
-        serverWithInternals.createSession = async () => {
-            return {
-                id: '',
-                createdAt: new Date().toISOString(),
-                requestCount: 0,
-                disposed: false,
-                server: {
-                    close: async () => {
-                        closed.push('server');
-                    },
-                },
-                transport: {
-                    close: async () => {
-                        closed.push('transport');
-                    },
-                    handleRequest: async () => {
-                        throw new Error('transport failure');
-                    },
-                },
-            };
-        };
+        const playResult = await client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: createPayload('/tmp/expected-root'),
+        });
+        const content = playResult.content as Array<{ type: string; text?: string }>;
 
-        const response = await postJson(endpointUrl, createInitializeRequest());
+        strictEqual(playResult.isError, true);
+        strictEqual(worker.executedPayloads.length, 0);
+        match(content[0]?.text ?? '', /No live Patchwalk window matched/);
+    });
 
-        await assertInternalServerErrorResponse(response);
-        deepStrictEqual(closed.sort(), ['server', 'transport']);
-        strictEqual(server.activeSessionCount, 1);
+    it('drops stale workers on the next request cycle', async () => {
+        await daemonClient.registerWorker({
+            workerId: randomUUID(),
+            processId: process.pid,
+            extensionVersion: 'stale-worker',
+            workspaceRoots: ['/tmp/stale-root'],
+            lastSeenAt: '2020-01-01T00:00:00Z',
+            apiVersion: PATCHWALK_WORKER_API_VERSION,
+        });
+
+        const health = await daemonClient.fetchHealth();
+        strictEqual(health.workerCount, 0);
+    });
+
+    it('still serves the example payload and operator manual resources', async () => {
+        const exampleHandoff = JSON.parse(
+            await readTextResource(client, PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI),
+        ) as PatchwalkHandoffPayload;
+        strictEqual(exampleHandoff.basePath, '/Users/example/project');
+
+        const operatorManual = await readTextResource(
+            client,
+            PATCHWALK_OPERATOR_MANUAL_RESOURCE_URI,
+        );
+        match(operatorManual, /basePath/);
+        match(operatorManual, /longest parent-path match/);
+
+        const authoringGuide = await readTextResource(
+            client,
+            PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
+        );
+        match(authoringGuide, /semantic patch explanation/);
+        match(authoringGuide, /Risk analysis/);
+        match(authoringGuide, /Blast radius/);
+
+        const composePrompt = await client.getPrompt({
+            name: PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
+            arguments: {
+                changeSummary: 'Refactor the authentication flow.',
+                changedFiles: 'src/auth.ts\nsrc/session.ts',
+                focusAreas: 'Emphasize behavior change and security implications.',
+            },
+        });
+        if (composePrompt.messages[0]?.content.type !== 'text') {
+            throw new Error('Expected text compose prompt content.');
+        }
+
+        match(composePrompt.messages[0].content.text, /behavior change/);
+        match(composePrompt.messages[0].content.text, /risk signals/);
     });
 });

@@ -1,5 +1,11 @@
+import path from 'node:path';
+
 import { z } from 'zod';
 
+/**
+ * The public handoff payload is intentionally strict because it crosses process boundaries and
+ * eventually drives editor navigation and narration.
+ */
 const nonEmptyStringPattern = /\S/;
 
 const nonEmptyStringSchema = z
@@ -17,6 +23,7 @@ export const patchwalkRangeSchema = z
         endLine: positiveIntegerSchema,
     })
     .superRefine((value, context) => {
+        // Reversed ranges make playback highlights confusing, so reject them up front.
         if (value.endLine < value.startLine) {
             context.addIssue({
                 code: z.ZodIssueCode.custom,
@@ -47,6 +54,10 @@ export const patchwalkHandoffPayloadSchema = z.strictObject({
     specVersion: nonEmptyStringSchema,
     handoffId: nonEmptyStringSchema,
     createdAt: z.iso.datetime({ offset: true }),
+    // Routing depends on this being absolute before the daemon sees the payload.
+    basePath: nonEmptyStringSchema.refine((value) => path.isAbsolute(value), {
+        message: 'must be an absolute filesystem path.',
+    }),
     producer: patchwalkProducerSchema,
     summary: nonEmptyStringSchema,
     walkthrough: z.array(patchwalkWalkthroughStepSchema).min(1, 'must contain at least one step.'),

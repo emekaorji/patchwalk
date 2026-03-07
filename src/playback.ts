@@ -5,8 +5,15 @@ import * as vscode from 'vscode';
 import type { PatchwalkHandoffPayload, PatchwalkWalkthroughStep } from './schema';
 import { speakWithSystemVoice } from './tts';
 
+/**
+ * The playback runner owns every editor-side side effect: opening files, revealing ranges,
+ * highlighting code, and narrating the handoff.
+ */
 export class PatchwalkPlaybackRunner implements vscode.Disposable {
     private readonly highlightDecoration: vscode.TextEditorDecorationType;
+    /**
+     * Serialize playbacks so overlapping MCP requests do not fight over the editor.
+     */
     private playbackQueue: Promise<void> = Promise.resolve();
 
     public constructor(private readonly outputChannel: vscode.OutputChannel) {
@@ -36,16 +43,20 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
         this.outputChannel.appendLine(`Starting Patchwalk handoff: ${payload.handoffId}`);
         await this.speak(payload.summary);
 
+        // Walkthrough order matters because the payload is authored as a guided explanation.
         await payload.walkthrough.reduce<Promise<void>>(async (queue, step) => {
             await queue;
-            await this.playStep(step);
+            await this.playStep(payload, step);
         }, Promise.resolve());
 
         this.outputChannel.appendLine(`Finished Patchwalk handoff: ${payload.handoffId}`);
     }
 
-    private async playStep(step: PatchwalkWalkthroughStep): Promise<void> {
-        const fileUri = this.resolveFileUri(step.path);
+    private async playStep(
+        payload: PatchwalkHandoffPayload,
+        step: PatchwalkWalkthroughStep,
+    ): Promise<void> {
+        const fileUri = this.resolveFileUri(payload.basePath, step.path);
         if (!fileUri) {
             this.outputChannel.appendLine(
                 `Unable to resolve file path for step ${step.id}: ${step.path}`,
@@ -79,6 +90,7 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
         const startLine = Math.min(Math.max(step.range.startLine - 1, 0), maximumLine);
         const endLine = Math.min(Math.max(step.range.endLine - 1, startLine), maximumLine);
 
+        // Reveal the first line, but highlight the full step range so the speaker can narrate context.
         const revealRange = new vscode.Range(startLine, 0, startLine, 0);
         const endLineCharacter = document.lineAt(endLine).range.end.character;
         const highlightRange = new vscode.Range(startLine, 0, endLine, endLineCharacter);
@@ -94,23 +106,17 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
         }
     }
 
-    private resolveFileUri(filePath: string): vscode.Uri | undefined {
+    private resolveFileUri(basePath: string, filePath: string): vscode.Uri | undefined {
         if (path.isAbsolute(filePath)) {
             return vscode.Uri.file(filePath);
         }
 
-        const activeWorkspaceFolder =
-            vscode.window.activeTextEditor?.document.uri &&
-            vscode.workspace.getWorkspaceFolder(vscode.window.activeTextEditor.document.uri);
-
-        const fallbackWorkspaceFolder = vscode.workspace.workspaceFolders?.[0];
-        const workspaceFolder = activeWorkspaceFolder ?? fallbackWorkspaceFolder;
-
-        if (!workspaceFolder) {
+        // Relative walkthrough paths are anchored to the routed project root, not the active tab.
+        if (!path.isAbsolute(basePath)) {
             return undefined;
         }
 
-        return vscode.Uri.joinPath(workspaceFolder.uri, filePath);
+        return vscode.Uri.file(path.resolve(basePath, filePath));
     }
 
     private async speak(text: string): Promise<void> {

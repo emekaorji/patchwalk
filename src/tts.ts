@@ -1,6 +1,10 @@
 import { spawn } from 'node:child_process';
 import process from 'node:process';
 
+/**
+ * TTS stays intentionally lightweight for now: use whatever the local OS already provides, and fall
+ * back between common Linux speech tools.
+ */
 const runCommand = (command: string, args: string[]): Promise<void> => {
     return new Promise((resolve, reject) => {
         const childProcess = spawn(command, args, {
@@ -29,6 +33,7 @@ const runCommand = (command: string, args: string[]): Promise<void> => {
 };
 
 const normalizeText = (text: string): string => {
+    // TTS engines sound noticeably better when fed normalized whitespace.
     return text.replaceAll(/\s+/g, ' ').trim();
 };
 
@@ -43,6 +48,7 @@ export const speakWithSystemVoice = async (text: string): Promise<void> => {
         return;
     }
 
+    // Windows gets a minimal PowerShell speech bridge without extra dependencies.
     if (process.platform === 'win32') {
         const escapedText = normalizedText.replaceAll("'", "''");
         const script =
@@ -54,6 +60,7 @@ export const speakWithSystemVoice = async (text: string): Promise<void> => {
     }
 
     try {
+        // Linux distributions vary, so try the more common daemon-backed option first.
         await runCommand('spd-say', [normalizedText]);
         return;
     } catch {

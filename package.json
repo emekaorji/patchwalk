@@ -49,12 +49,16 @@
     "contributes": {
         "commands": [
             {
-                "command": "patchwalk.startMcpServer",
-                "title": "Patchwalk: Start MCP Server"
+                "command": "patchwalk.restartDaemon",
+                "title": "Patchwalk: Restart Daemon"
             },
             {
-                "command": "patchwalk.stopMcpServer",
-                "title": "Patchwalk: Stop MCP Server"
+                "command": "patchwalk.showDaemonStatus",
+                "title": "Patchwalk: Show Daemon Status"
+            },
+            {
+                "command": "patchwalk.stopDaemon",
+                "title": "Patchwalk: Stop Daemon"
             },
             {
                 "command": "patchwalk.playFromClipboard",
@@ -64,17 +68,12 @@
         "configuration": {
             "title": "Patchwalk",
             "properties": {
-                "patchwalk.autoStartMcpServer": {
-                    "type": "boolean",
-                    "default": true,
-                    "description": "Automatically start the local Patchwalk MCP server when the extension activates."
-                },
-                "patchwalk.mcpPort": {
+                "patchwalk.daemonPort": {
                     "type": "number",
                     "default": 7357,
                     "minimum": 1,
                     "maximum": 65535,
-                    "description": "Local TCP port used by the Patchwalk MCP HTTP endpoint."
+                    "description": "Local TCP port used by the Patchwalk daemon MCP HTTP endpoint."
                 }
             }
         }

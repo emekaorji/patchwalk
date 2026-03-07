@@ -3,20 +3,40 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import process from 'node:process';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import type * as vscode from 'vscode';
 import { z } from 'zod';
 
-import type { PatchwalkStatusResource } from './mcpCatalog';
+import type {
+    PatchwalkWorkerEvent,
+    PatchwalkWorkerHeartbeat,
+    PatchwalkWorkerRegistration,
+} from './controlProtocol';
 import {
+    PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS,
+    PATCHWALK_DEFAULT_POLL_INTERVAL_MS,
+    patchwalkWorkerClaimSchema,
+    patchwalkWorkerHeartbeatSchema,
+    patchwalkWorkerRegistrationResponseSchema,
+    patchwalkWorkerRegistrationSchema,
+    patchwalkWorkerResultSchema,
+} from './controlProtocol';
+import type {
+    PatchwalkDispatchStatusResource,
+    PatchwalkStatusResource,
+    PatchwalkWorkerStatusResource,
+} from './mcpCatalog';
+import {
+    createPatchwalkAuthoringGuide,
     createPatchwalkComposePromptText,
     createPatchwalkExampleHandoff,
     createPatchwalkExpandWalkthroughPromptText,
     createPatchwalkOperatorManual,
     normalizePatchwalkPlayPayload,
+    PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
     PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
     PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
     PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME,
@@ -27,12 +47,22 @@ import {
     patchwalkPlayArgumentsSchema,
     patchwalkPlayResultSchema,
 } from './mcpCatalog';
+import { normalizeAbsolutePath } from './pathUtils';
+import type { PatchwalkWorkerClaimSummary } from './routing';
+import { compareWorkerClaims } from './routing';
 import type { PatchwalkHandoffPayload } from './schema';
 
+/**
+ * The daemon owns two related protocols:
+ *
+ * 1. The public MCP surface exposed to AI clients
+ * 2. The private worker-control API used by live editor windows
+ *
+ * This file intentionally keeps both in one place because dispatch routing needs full visibility
+ * into MCP calls, registered workers, and playback completion signals.
+ */
 interface PatchwalkMcpServerOptions {
     port: number;
-    outputChannel: vscode.OutputChannel;
-    onPlayPayload: (payload: PatchwalkHandoffPayload) => Promise<void>;
 }
 
 interface JsonRpcErrorResponse {
@@ -53,10 +83,58 @@ interface PatchwalkMcpSession {
     transport: StreamableHTTPServerTransport;
 }
 
+interface PendingWorkerPoll {
+    resolve: (events: PatchwalkWorkerEvent[]) => void;
+    timeout: NodeJS.Timeout;
+}
+
+interface RegisteredWorker {
+    workerId: string;
+    processId: number;
+    extensionVersion: string;
+    workspaceRoots: string[];
+    registeredAt: string;
+    registeredSequence: number;
+    lastSeenAt: string;
+    pendingEvents: PatchwalkWorkerEvent[];
+    pendingPoll?: PendingWorkerPoll;
+}
+
+// Dispatch results are normalized before they are returned to the MCP tool caller.
+interface DispatchExecutionResult {
+    workerId: string;
+    matchedRoot: string;
+    handoffId: string;
+    stepsPlayed: number;
+}
+
+interface ActiveDispatch {
+    dispatchId: string;
+    payload: PatchwalkHandoffPayload;
+    createdAt: string;
+    state: 'claiming' | 'executing';
+    claims: PatchwalkWorkerClaimSummary[];
+    selectedWorkerId?: string;
+    selectedMatchedRoot?: string;
+    resultPromise: Promise<DispatchExecutionResult>;
+    resolveResult: (value: DispatchExecutionResult) => void;
+    rejectResult: (error: Error) => void;
+}
+
 const HEALTH_PATH = '/health';
 const MCP_PATH = '/mcp';
+const WORKERS_PATH = '/workers';
+const DAEMON_SHUTDOWN_PATH = '/daemon/shutdown';
 const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
+const DEFAULT_LONG_POLL_TIMEOUT_MS = 25_000;
+const MAX_LONG_POLL_TIMEOUT_MS = 30_000;
+const CLAIM_WINDOW_MS = 600;
+const EXECUTION_TIMEOUT_MS = 5 * 60_000;
+const STALE_WORKER_TIMEOUT_MS = 20_000;
 
+/**
+ * MCP transport helpers stay local so protocol failures never leak raw implementation details.
+ */
 const createJsonRpcErrorResponse = (
     code: number,
     message: string,
@@ -72,9 +150,12 @@ const createJsonRpcErrorResponse = (
     };
 };
 
+const getRequestUrl = (request: IncomingMessage): URL => {
+    return new URL(request.url ?? '/', 'http://127.0.0.1');
+};
+
 const getRequestPath = (request: IncomingMessage): string => {
-    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-    return url.pathname;
+    return getRequestUrl(request).pathname;
 };
 
 const getSessionId = (request: IncomingMessage): string | undefined => {
@@ -82,11 +163,85 @@ const getSessionId = (request: IncomingMessage): string | undefined => {
     return typeof headerValue === 'string' && headerValue.length > 0 ? headerValue : undefined;
 };
 
-const createPromptArgsSchema = <Shape extends z.ZodRawShape>(shape: Shape): Shape => shape;
+/**
+ * Claim windows are short on purpose so one routed playback still feels immediate.
+ */
+const createDelay = (durationMs: number): Promise<void> => {
+    return new Promise((resolve) => {
+        setTimeout(resolve, durationMs);
+    });
+};
+
+const patchwalkComposePromptArgsSchema = {
+    changeSummary: z.string().describe('High-level summary of the change.'),
+    changedFiles: z
+        .string()
+        .optional()
+        .describe('Optional newline-separated changed files or modules.'),
+    focusAreas: z
+        .string()
+        .optional()
+        .describe('Optional implementation details that deserve deeper narration.'),
+};
+
+const patchwalkExpandWalkthroughPromptArgsSchema = {
+    summary: z.string().describe('Short summary of the change or feature.'),
+    files: z.string().describe('Relevant files, one per line or as grouped bullets.'),
+    detailLevel: z
+        .string()
+        .optional()
+        .describe('Optional detail preference such as concise, detailed, or exhaustive.'),
+};
+
+const createTimeoutError = (message: string): Error => {
+    const timeoutError = new Error(message);
+    timeoutError.name = 'TimeoutError';
+    return timeoutError;
+};
+
+const withTimeout = async <T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    message: string,
+): Promise<T> => {
+    const timeoutPromise = new Promise<T>((_resolve, reject) => {
+        setTimeout(() => {
+            reject(createTimeoutError(message));
+        }, timeoutMs);
+    });
+
+    return Promise.race([promise, timeoutPromise]);
+};
+
+const normalizeWorkspaceRoots = async (workspaceRoots: string[]): Promise<string[]> => {
+    const normalizedRoots = await Promise.all(
+        workspaceRoots.map((workspaceRoot) => normalizeAbsolutePath(workspaceRoot)),
+    );
+    return [...new Set(normalizedRoots)].sort((leftRoot, rightRoot) =>
+        leftRoot.localeCompare(rightRoot),
+    );
+};
+
+/**
+ * Worker sub-routes all follow /workers/:workerId/:action.
+ */
+const getWorkerPathParts = (requestPath: string): string[] | undefined => {
+    if (!requestPath.startsWith(`${WORKERS_PATH}/`)) {
+        return undefined;
+    }
+
+    return requestPath
+        .slice(WORKERS_PATH.length + 1)
+        .split('/')
+        .filter(Boolean);
+};
 
 export class PatchwalkMcpServer {
     private server: Server | undefined;
     private readonly sessions = new Map<string, PatchwalkMcpSession>();
+    private readonly workers = new Map<string, RegisteredWorker>();
+    private readonly activeDispatches = new Map<string, ActiveDispatch>();
+    private workerSequence = 0;
     private startedAt: string | null = null;
 
     public constructor(private readonly options: PatchwalkMcpServerOptions) {}
@@ -118,6 +273,7 @@ export class PatchwalkMcpServer {
             return;
         }
 
+        // One HTTP server handles MCP and worker traffic so both sides share runtime state.
         this.server = createServer(async (request, response) => {
             await this.handleHttpRequestSafely(request, response);
         });
@@ -139,8 +295,22 @@ export class PatchwalkMcpServer {
     }
 
     public async stop(): Promise<void> {
+        // Stop sessions, workers, and in-flight dispatches in that order so callers fail deterministically.
         const sessionIds = [...this.sessions.keys()];
         await Promise.allSettled(sessionIds.map((sessionId) => this.disposeSession(sessionId)));
+
+        const workers = [...this.workers.values()];
+        for (const worker of workers) {
+            this.disposeWorker(worker.workerId);
+        }
+
+        const dispatches = [...this.activeDispatches.values()];
+        for (const dispatch of dispatches) {
+            dispatch.rejectResult(
+                new Error('Patchwalk daemon stopped before the dispatch completed.'),
+            );
+            this.activeDispatches.delete(dispatch.dispatchId);
+        }
 
         if (!this.server) {
             this.startedAt = null;
@@ -169,11 +339,7 @@ export class PatchwalkMcpServer {
         try {
             await this.handleHttpRequest(request, response);
         } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            this.options.outputChannel.appendLine(
-                `Patchwalk MCP request ${request.method ?? 'UNKNOWN'} ${getRequestPath(request)} failed: ${message}`,
-            );
-
+            // The daemon always prefers a structured failure response over a hung connection.
             if (!response.headersSent) {
                 this.writeJsonResponse(
                     response,
@@ -186,6 +352,10 @@ export class PatchwalkMcpServer {
             if (!response.writableEnded) {
                 response.end();
             }
+
+            if (error instanceof Error) {
+                console.error(error);
+            }
         }
     }
 
@@ -193,29 +363,65 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
+        // Opportunistic pruning keeps the registry honest without a separate cleanup loop.
+        this.pruneStaleWorkers();
+
         const requestPath = getRequestPath(request);
 
         if (request.method === 'GET' && requestPath === HEALTH_PATH) {
             this.writeJsonResponse(response, 200, {
                 ok: true,
                 endpointUrl: this.endpointUrl ?? null,
+                daemonPid: process.pid,
                 activeSessionCount: this.activeSessionCount,
+                workerCount: this.workers.size,
+                activeDispatchCount: this.activeDispatches.size,
             });
             return;
         }
 
-        if (requestPath !== MCP_PATH) {
-            this.writeJsonResponse(response, 404, { error: 'Not found' });
+        if (request.method === 'POST' && requestPath === DAEMON_SHUTDOWN_PATH) {
+            this.writeJsonResponse(response, 202, {
+                ok: true,
+                message: 'Patchwalk daemon shutdown requested.',
+            });
+
+            setImmediate(() => {
+                // Respond first so callers do not race the process shutdown path.
+                this.stop().catch((error: unknown) => {
+                    console.error(error);
+                });
+            });
             return;
         }
 
+        if (requestPath === MCP_PATH) {
+            await this.handleMcpRequest(request, response);
+            return;
+        }
+
+        if (requestPath === WORKERS_PATH && request.method === 'POST') {
+            await this.handleWorkerRegistration(request, response);
+            return;
+        }
+
+        if (requestPath.startsWith(`${WORKERS_PATH}/`)) {
+            await this.handleWorkerRequest(request, response);
+            return;
+        }
+
+        this.writeJsonResponse(response, 404, { error: 'Not found' });
+    }
+
+    private async handleMcpRequest(
+        request: IncomingMessage,
+        response: ServerResponse,
+    ): Promise<void> {
         switch (request.method) {
             case 'POST':
                 await this.handlePostRequest(request, response);
                 return;
             case 'GET':
-                await this.handleSessionBoundRequest(request, response);
-                return;
             case 'DELETE':
                 await this.handleSessionBoundRequest(request, response);
                 return;
@@ -228,6 +434,204 @@ export class PatchwalkMcpServer {
                 );
                 return;
         }
+    }
+
+    private async handleWorkerRegistration(
+        request: IncomingMessage,
+        response: ServerResponse,
+    ): Promise<void> {
+        const parsedBody = patchwalkWorkerRegistrationSchema.safeParse(
+            await this.readJsonBody(request),
+        );
+        if (!parsedBody.success) {
+            this.writeJsonResponse(response, 400, {
+                error:
+                    parsedBody.error.issues[0]?.message ?? 'Invalid worker registration payload.',
+            });
+            return;
+        }
+
+        const normalizedRegistration = await this.normalizeWorkerRegistration(parsedBody.data);
+        const registeredWorker = this.upsertWorker(normalizedRegistration);
+
+        // The daemon publishes cadence so workers do not hardcode lifecycle assumptions.
+        const registrationResponse = patchwalkWorkerRegistrationResponseSchema.parse({
+            workerId: registeredWorker.workerId,
+            daemonPid: process.pid,
+            pollIntervalMs: PATCHWALK_DEFAULT_POLL_INTERVAL_MS,
+            heartbeatIntervalMs: PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS,
+        });
+        this.writeJsonResponse(response, 200, registrationResponse);
+    }
+
+    private async handleWorkerRequest(
+        request: IncomingMessage,
+        response: ServerResponse,
+    ): Promise<void> {
+        const pathParts = getWorkerPathParts(getRequestPath(request));
+        if (!pathParts || pathParts.length !== 2) {
+            this.writeJsonResponse(response, 404, { error: 'Unknown worker endpoint.' });
+            return;
+        }
+
+        const [workerId, action] = pathParts;
+        const worker = this.workers.get(workerId);
+        if (!worker) {
+            this.writeJsonResponse(response, 404, { error: 'Worker not registered.' });
+            return;
+        }
+
+        switch (action) {
+            case 'heartbeat':
+                if (request.method !== 'POST') {
+                    this.writeJsonResponse(response, 405, { error: 'Method not allowed.' });
+                    return;
+                }
+
+                await this.handleWorkerHeartbeat(worker, request, response);
+                return;
+            case 'events':
+                if (request.method !== 'GET') {
+                    this.writeJsonResponse(response, 405, { error: 'Method not allowed.' });
+                    return;
+                }
+
+                await this.handleWorkerEvents(worker, request, response);
+                return;
+            case 'claims':
+                if (request.method !== 'POST') {
+                    this.writeJsonResponse(response, 405, { error: 'Method not allowed.' });
+                    return;
+                }
+
+                await this.handleWorkerClaim(worker, request, response);
+                return;
+            case 'results':
+                if (request.method !== 'POST') {
+                    this.writeJsonResponse(response, 405, { error: 'Method not allowed.' });
+                    return;
+                }
+
+                await this.handleWorkerResult(worker, request, response);
+                return;
+            default:
+                this.writeJsonResponse(response, 404, { error: 'Unknown worker endpoint.' });
+                return;
+        }
+    }
+
+    private async handleWorkerHeartbeat(
+        worker: RegisteredWorker,
+        request: IncomingMessage,
+        response: ServerResponse,
+    ): Promise<void> {
+        const parsedBody = patchwalkWorkerHeartbeatSchema.safeParse(
+            await this.readJsonBody(request),
+        );
+        if (!parsedBody.success) {
+            this.writeJsonResponse(response, 400, {
+                error: parsedBody.error.issues[0]?.message ?? 'Invalid worker heartbeat payload.',
+            });
+            return;
+        }
+
+        const heartbeat = await this.normalizeWorkerHeartbeat(parsedBody.data);
+        // Workers can add or remove workspace roots during their lifetime.
+        worker.workspaceRoots = heartbeat.workspaceRoots;
+        worker.lastSeenAt = heartbeat.lastSeenAt;
+
+        this.writeJsonResponse(response, 200, { ok: true });
+    }
+
+    private async handleWorkerEvents(
+        worker: RegisteredWorker,
+        request: IncomingMessage,
+        response: ServerResponse,
+    ): Promise<void> {
+        const waitMsValue = Number(getRequestUrl(request).searchParams.get('waitMs') ?? '');
+        const waitMs = Number.isFinite(waitMsValue)
+            ? Math.min(Math.max(waitMsValue, 1), MAX_LONG_POLL_TIMEOUT_MS)
+            : DEFAULT_LONG_POLL_TIMEOUT_MS;
+
+        const events = await this.waitForWorkerEvents(worker, waitMs);
+        this.writeJsonResponse(response, 200, {
+            events,
+            pollIntervalMs: PATCHWALK_DEFAULT_POLL_INTERVAL_MS,
+        });
+    }
+
+    private async handleWorkerClaim(
+        worker: RegisteredWorker,
+        request: IncomingMessage,
+        response: ServerResponse,
+    ): Promise<void> {
+        const parsedBody = patchwalkWorkerClaimSchema.safeParse(await this.readJsonBody(request));
+        if (!parsedBody.success) {
+            this.writeJsonResponse(response, 400, {
+                error: parsedBody.error.issues[0]?.message ?? 'Invalid worker claim payload.',
+            });
+            return;
+        }
+
+        const claim = parsedBody.data;
+        const dispatch = this.activeDispatches.get(claim.dispatchId);
+        if (!dispatch || dispatch.state !== 'claiming' || !claim.accepted) {
+            // Late or rejected claims are not fatal; they simply miss the claim window.
+            this.writeJsonResponse(response, 202, { ok: true });
+            return;
+        }
+
+        // One worker can refresh its claim while the window is still open, so replace by worker id.
+        dispatch.claims = [
+            ...dispatch.claims.filter(
+                (existingClaim) => existingClaim.workerId !== worker.workerId,
+            ),
+            {
+                workerId: worker.workerId,
+                matchedRoot: claim.matchedRoot!,
+                matchKind: claim.matchKind!,
+                registeredSequence: worker.registeredSequence,
+            },
+        ];
+
+        this.writeJsonResponse(response, 202, { ok: true });
+    }
+
+    private async handleWorkerResult(
+        worker: RegisteredWorker,
+        request: IncomingMessage,
+        response: ServerResponse,
+    ): Promise<void> {
+        const parsedBody = patchwalkWorkerResultSchema.safeParse(await this.readJsonBody(request));
+        if (!parsedBody.success) {
+            this.writeJsonResponse(response, 400, {
+                error: parsedBody.error.issues[0]?.message ?? 'Invalid worker result payload.',
+            });
+            return;
+        }
+
+        const result = parsedBody.data;
+        const dispatch = this.activeDispatches.get(result.dispatchId);
+        if (!dispatch || dispatch.selectedWorkerId !== worker.workerId) {
+            this.writeJsonResponse(response, 404, {
+                error: 'Dispatch not found for worker result.',
+            });
+            return;
+        }
+
+        // Results are the handoff between editor-side playback and the MCP tool response.
+        if (result.status === 'completed') {
+            dispatch.resolveResult({
+                workerId: worker.workerId,
+                matchedRoot: dispatch.selectedMatchedRoot ?? dispatch.payload.basePath,
+                handoffId: result.handoffId,
+                stepsPlayed: result.stepsPlayed!,
+            });
+        } else {
+            dispatch.rejectResult(new Error(result.error));
+        }
+
+        this.writeJsonResponse(response, 202, { ok: true });
     }
 
     private async handlePostRequest(
@@ -278,7 +682,7 @@ export class PatchwalkMcpServer {
         session.requestCount += 1;
         await this.forwardToTransport(session, request, response, parsedBody);
 
-        // A failed initialize request can exit before the transport assigns a session id.
+        // Initialization can fail before the SDK assigns a session id.
         if (!session.id) {
             await this.disposeOrphanedSession(session);
         }
@@ -320,12 +724,8 @@ export class PatchwalkMcpServer {
     ): Promise<void> {
         try {
             await session.transport.handleRequest(request, response, parsedBody);
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            this.options.outputChannel.appendLine(
-                `Patchwalk MCP session ${session.id} request failed: ${message}`,
-            );
-
+        } catch {
+            // Keep SDK transport failures inside the daemon boundary.
             if (!response.headersSent) {
                 this.writeJsonResponse(
                     response,
@@ -350,16 +750,11 @@ export class PatchwalkMcpServer {
                     return;
                 }
 
+                // Session ids are only known after the transport finishes initialize negotiation.
                 sessionRef.current.id = sessionId;
                 this.sessions.set(sessionId, sessionRef.current);
-                this.options.outputChannel.appendLine(
-                    `Patchwalk MCP session started: ${sessionId}`,
-                );
             },
             onsessionclosed: (sessionId) => {
-                this.options.outputChannel.appendLine(
-                    `Patchwalk MCP session closing: ${sessionId}`,
-                );
                 return this.disposeSession(sessionId);
             },
         });
@@ -393,10 +788,11 @@ export class PatchwalkMcpServer {
             PATCHWALK_STATUS_RESOURCE_URI,
             {
                 title: 'Patchwalk Server Status',
-                description: 'Runtime information for the local Patchwalk MCP server.',
+                description: 'Runtime information for the local Patchwalk daemon.',
                 mimeType: 'application/json',
             },
             async () => {
+                // Status is generated live so it reflects current workers and dispatches.
                 return {
                     contents: [
                         {
@@ -415,7 +811,7 @@ export class PatchwalkMcpServer {
             {
                 title: 'Patchwalk Operator Manual',
                 description:
-                    'Operational guidance for tools, prompts, resources, and transport use.',
+                    'Operational guidance for tools, prompts, resources, daemon recovery, and routing.',
                 mimeType: 'text/markdown',
             },
             async () => {
@@ -452,22 +848,34 @@ export class PatchwalkMcpServer {
             },
         );
 
+        server.registerResource(
+            'patchwalk-authoring-guide',
+            PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
+            {
+                title: 'Patchwalk Handoff Authoring Guide',
+                description: 'Developer-grade guidance for constructing useful Patchwalk payloads.',
+                mimeType: 'text/markdown',
+            },
+            async () => {
+                return {
+                    contents: [
+                        {
+                            uri: PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
+                            mimeType: 'text/markdown',
+                            text: `${createPatchwalkAuthoringGuide()}\n`,
+                        },
+                    ],
+                };
+            },
+        );
+
         server.registerPrompt(
             PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
             {
                 title: 'Compose Patchwalk Handoff',
-                description: 'Draft a full Patchwalk handoff payload from a change summary.',
-                argsSchema: createPromptArgsSchema({
-                    changeSummary: z.string().describe('High-level summary of the change.'),
-                    changedFiles: z
-                        .string()
-                        .optional()
-                        .describe('Optional newline-separated changed files or modules.'),
-                    focusAreas: z
-                        .string()
-                        .optional()
-                        .describe('Optional implementation details that deserve deeper narration.'),
-                }),
+                description:
+                    'Draft a developer-grade Patchwalk handoff with semantic explanation, risk analysis, blast radius, and meaningful before-vs-after behavior.',
+                argsSchema: patchwalkComposePromptArgsSchema,
             },
             async (args) => {
                 return {
@@ -488,19 +896,9 @@ export class PatchwalkMcpServer {
             PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME,
             {
                 title: 'Expand Patchwalk Walkthrough',
-                description: 'Turn a summary and file list into narrated walkthrough steps.',
-                argsSchema: createPromptArgsSchema({
-                    summary: z.string().describe('Short summary of the change or feature.'),
-                    files: z
-                        .string()
-                        .describe('Relevant files, one per line or as grouped bullets.'),
-                    detailLevel: z
-                        .string()
-                        .optional()
-                        .describe(
-                            'Optional detail preference such as concise, detailed, or exhaustive.',
-                        ),
-                }),
+                description:
+                    'Turn a change summary and file list into a strong engineer-facing walkthrough with intent, consequences, and reviewer-significant signals.',
+                argsSchema: patchwalkExpandWalkthroughPromptArgsSchema,
             },
             async (args) => {
                 return {
@@ -522,7 +920,7 @@ export class PatchwalkMcpServer {
             {
                 title: 'Patchwalk Playback',
                 description:
-                    'Play a Patchwalk handoff payload inside VS Code with file navigation, highlighting, and narration.',
+                    'Route a Patchwalk handoff to the best matching live editor window and play it there. Construct payloads as semantic patch explanations for engineers: explain behavior change, why it matters, risk signals, blast radius, before-vs-after behavior, tests, and architecture where relevant; filter out formatting and import-order noise.',
                 inputSchema: patchwalkPlayArgumentsSchema,
                 outputSchema: patchwalkPlayResultSchema,
                 annotations: {
@@ -531,28 +929,54 @@ export class PatchwalkMcpServer {
                 },
             },
             async (argumentsValue, extra) => {
-                const payload = normalizePatchwalkPlayPayload(argumentsValue);
+                // Normalize the payload once so routing, status, and playback all see the same basePath.
+                const payload = await this.normalizePayload(
+                    normalizePatchwalkPlayPayload(argumentsValue),
+                );
                 const session = getSession();
 
                 await server.sendLoggingMessage(
                     {
                         level: 'info',
-                        data: `Starting Patchwalk playback for ${payload.handoffId}`,
+                        data: `Starting Patchwalk routing for ${payload.handoffId}`,
                     },
                     extra.sessionId,
                 );
 
-                this.options.outputChannel.appendLine(
-                    `Received handoff ${payload.handoffId} via ${PATCHWALK_PLAY_TOOL_NAME}`,
-                );
-
                 try {
-                    await this.options.onPlayPayload(payload);
+                    const dispatchResult = await this.dispatchPlayback(payload);
+
+                    await server.sendLoggingMessage(
+                        {
+                            level: 'info',
+                            data: `Completed Patchwalk playback for ${payload.handoffId} via worker ${dispatchResult.workerId}`,
+                        },
+                        extra.sessionId,
+                    );
+
+                    return {
+                        structuredContent: {
+                            handoffId: payload.handoffId,
+                            status: 'completed' as const,
+                            stepsPlayed: dispatchResult.stepsPlayed,
+                            workerId: dispatchResult.workerId,
+                            matchedRoot: dispatchResult.matchedRoot,
+                        },
+                        content: [
+                            {
+                                type: 'text' as const,
+                                text: `Patchwalk playback completed for ${payload.handoffId}.`,
+                            },
+                            {
+                                type: 'text' as const,
+                                text: session
+                                    ? `Session ${session.id} handled ${session.requestCount} MCP request(s).`
+                                    : `Worker ${dispatchResult.workerId} handled the playback.`,
+                            },
+                        ],
+                    };
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error);
-                    this.options.outputChannel.appendLine(
-                        `Patchwalk playback failed for ${payload.handoffId}: ${message}`,
-                    );
 
                     await server.sendLoggingMessage(
                         {
@@ -561,40 +985,17 @@ export class PatchwalkMcpServer {
                         },
                         extra.sessionId,
                     );
-                    throw error;
+
+                    return {
+                        isError: true,
+                        content: [
+                            {
+                                type: 'text' as const,
+                                text: `Patchwalk playback failed for ${payload.handoffId}: ${message}`,
+                            },
+                        ],
+                    };
                 }
-
-                this.options.outputChannel.appendLine(
-                    `Completed handoff ${payload.handoffId} via ${PATCHWALK_PLAY_TOOL_NAME}`,
-                );
-
-                await server.sendLoggingMessage(
-                    {
-                        level: 'info',
-                        data: `Completed Patchwalk playback for ${payload.handoffId}`,
-                    },
-                    extra.sessionId,
-                );
-
-                return {
-                    structuredContent: {
-                        handoffId: payload.handoffId,
-                        status: 'completed' as const,
-                        stepsPlayed: payload.walkthrough.length,
-                    },
-                    content: [
-                        {
-                            type: 'text' as const,
-                            text: `Patchwalk playback completed for ${payload.handoffId}.`,
-                        },
-                        {
-                            type: 'text' as const,
-                            text: session
-                                ? `Session ${session.id} handled ${session.requestCount} MCP request(s).`
-                                : 'Playback completed without a recorded session.',
-                        },
-                    ],
-                };
             },
         );
 
@@ -603,22 +1004,50 @@ export class PatchwalkMcpServer {
 
     private createServerInstructions(): string {
         return [
-            'Patchwalk replays narrated code handoffs inside VS Code.',
-            `Read ${PATCHWALK_STATUS_RESOURCE_URI} for runtime status.`,
+            'Patchwalk replays narrated code handoffs inside live editor windows.',
+            `Read ${PATCHWALK_STATUS_RESOURCE_URI} for daemon, worker, and dispatch status.`,
             `Read ${PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI} for a valid payload example.`,
+            `Read ${PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI} before generating payloads for non-trivial changes.`,
             `Use ${PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME} or ${PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME} to draft handoff content.`,
-            `Call ${PATCHWALK_PLAY_TOOL_NAME} with a Patchwalk handoff payload to start playback.`,
+            `Call ${PATCHWALK_PLAY_TOOL_NAME} with a Patchwalk handoff payload that includes basePath and meaningful developer-facing narration.`,
         ].join(' ');
     }
 
     private createStatusResource(): PatchwalkStatusResource {
         const endpointUrl = this.endpointUrl ?? MCP_PATH;
+        // Status resources flatten internal maps into plain JSON so clients can render them directly.
+        const workers: PatchwalkWorkerStatusResource[] = [...this.workers.values()].map(
+            (worker) => ({
+                workerId: worker.workerId,
+                processId: worker.processId,
+                extensionVersion: worker.extensionVersion,
+                workspaceRoots: worker.workspaceRoots,
+                registeredAt: worker.registeredAt,
+                lastSeenAt: worker.lastSeenAt,
+            }),
+        );
+        const activeDispatches: PatchwalkDispatchStatusResource[] = [
+            ...this.activeDispatches.values(),
+        ].map((dispatch) => ({
+            dispatchId: dispatch.dispatchId,
+            handoffId: dispatch.payload.handoffId,
+            basePath: dispatch.payload.basePath,
+            state: dispatch.state,
+            createdAt: dispatch.createdAt,
+            selectedWorkerId: dispatch.selectedWorkerId,
+        }));
 
         return {
             endpointUrl,
             healthUrl: endpointUrl.replace(/\/mcp$/, '/health'),
             startedAt: this.startedAt,
+            daemonPid: process.pid,
+            configuredPort: this.listeningPort ?? this.options.port,
             activeSessionCount: this.activeSessionCount,
+            workerCount: workers.length,
+            workers,
+            activeDispatchCount: activeDispatches.length,
+            activeDispatches,
             prompts: [
                 PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
                 PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME,
@@ -627,8 +1056,234 @@ export class PatchwalkMcpServer {
                 PATCHWALK_STATUS_RESOURCE_URI,
                 PATCHWALK_OPERATOR_MANUAL_RESOURCE_URI,
                 PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
+                PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
             ],
             tools: [PATCHWALK_PLAY_TOOL_NAME],
+        };
+    }
+
+    private async dispatchPlayback(
+        payload: PatchwalkHandoffPayload,
+    ): Promise<DispatchExecutionResult> {
+        this.pruneStaleWorkers();
+
+        if (this.workers.size === 0) {
+            throw new Error('No live Patchwalk editor windows are registered.');
+        }
+
+        // Promise plumbing lives on the dispatch so worker results can resolve it from a different route.
+        const resultState = {} as {
+            resolve?: (value: DispatchExecutionResult) => void;
+            reject?: (error: Error) => void;
+        };
+        const resultPromise = new Promise<DispatchExecutionResult>((resolve, reject) => {
+            resultState.resolve = resolve;
+            resultState.reject = reject;
+        });
+
+        const dispatch: ActiveDispatch = {
+            dispatchId: randomUUID(),
+            payload,
+            createdAt: new Date().toISOString(),
+            state: 'claiming',
+            claims: [],
+            resultPromise,
+            resolveResult: resultState.resolve!,
+            rejectResult: resultState.reject!,
+        };
+        this.activeDispatches.set(dispatch.dispatchId, dispatch);
+
+        try {
+            const claimEvent: PatchwalkWorkerEvent = {
+                type: 'playback.claim',
+                eventId: randomUUID(),
+                dispatchId: dispatch.dispatchId,
+                handoffId: payload.handoffId,
+                basePath: payload.basePath,
+            };
+            for (const worker of this.workers.values()) {
+                // Broadcast one lightweight claim request to every live worker.
+                this.enqueueWorkerEvent(worker.workerId, claimEvent);
+            }
+
+            await createDelay(CLAIM_WINDOW_MS);
+
+            // Winner selection is deterministic and centralized in the daemon.
+            const selectedClaim = [...dispatch.claims].sort(compareWorkerClaims)[0];
+            if (!selectedClaim) {
+                throw new Error(
+                    `No live Patchwalk window matched the requested basePath: ${payload.basePath}`,
+                );
+            }
+
+            dispatch.state = 'executing';
+            dispatch.selectedWorkerId = selectedClaim.workerId;
+            dispatch.selectedMatchedRoot = selectedClaim.matchedRoot;
+
+            // Let losing workers clear any pending local state for this dispatch.
+            for (const claim of dispatch.claims) {
+                if (claim.workerId === selectedClaim.workerId) {
+                    continue;
+                }
+
+                this.enqueueWorkerEvent(claim.workerId, {
+                    type: 'playback.cancel',
+                    eventId: randomUUID(),
+                    dispatchId: dispatch.dispatchId,
+                    reason: `Worker ${selectedClaim.workerId} won the routing decision.`,
+                });
+            }
+
+            // Only the winner receives the full payload and performs editor-side work.
+            this.enqueueWorkerEvent(selectedClaim.workerId, {
+                type: 'playback.execute',
+                eventId: randomUUID(),
+                dispatchId: dispatch.dispatchId,
+                payload,
+            });
+
+            return await withTimeout(
+                dispatch.resultPromise,
+                EXECUTION_TIMEOUT_MS,
+                `Worker ${selectedClaim.workerId} did not complete playback in time.`,
+            );
+        } finally {
+            // Dispatches are purely in-memory and disappear once the tool call resolves.
+            this.activeDispatches.delete(dispatch.dispatchId);
+        }
+    }
+
+    private enqueueWorkerEvent(workerId: string, event: PatchwalkWorkerEvent): void {
+        const worker = this.workers.get(workerId);
+        if (!worker) {
+            return;
+        }
+
+        worker.pendingEvents.push(event);
+        if (!worker.pendingPoll) {
+            return;
+        }
+
+        const pendingPoll = worker.pendingPoll;
+        worker.pendingPoll = undefined;
+        clearTimeout(pendingPoll.timeout);
+        // Flush immediately if the worker is already waiting on a long-poll response.
+        const events = worker.pendingEvents.splice(0, worker.pendingEvents.length);
+        pendingPoll.resolve(events);
+    }
+
+    private async waitForWorkerEvents(
+        worker: RegisteredWorker,
+        timeoutMs: number,
+    ): Promise<PatchwalkWorkerEvent[]> {
+        if (worker.pendingEvents.length > 0) {
+            return worker.pendingEvents.splice(0, worker.pendingEvents.length);
+        }
+
+        if (worker.pendingPoll) {
+            // A second poll means the worker likely restarted its event loop; force reconciliation.
+            clearTimeout(worker.pendingPoll.timeout);
+            worker.pendingPoll.resolve([
+                {
+                    type: 'worker.reconcile',
+                    eventId: randomUUID(),
+                },
+            ]);
+            worker.pendingPoll = undefined;
+        }
+
+        return new Promise((resolve) => {
+            const timeout = setTimeout(() => {
+                if (worker.pendingPoll?.resolve === resolve) {
+                    worker.pendingPoll = undefined;
+                }
+
+                resolve([]);
+            }, timeoutMs);
+
+            worker.pendingPoll = {
+                resolve,
+                timeout,
+            };
+        });
+    }
+
+    private disposeWorker(workerId: string): void {
+        const worker = this.workers.get(workerId);
+        if (!worker) {
+            return;
+        }
+
+        if (worker.pendingPoll) {
+            clearTimeout(worker.pendingPoll.timeout);
+            // Resolve the hanging poll so worker shutdown does not leak promises.
+            worker.pendingPoll.resolve([]);
+            worker.pendingPoll = undefined;
+        }
+
+        this.workers.delete(workerId);
+    }
+
+    private pruneStaleWorkers(): void {
+        const now = Date.now();
+        for (const worker of this.workers.values()) {
+            const ageMs = now - new Date(worker.lastSeenAt).getTime();
+            if (ageMs > STALE_WORKER_TIMEOUT_MS) {
+                this.disposeWorker(worker.workerId);
+            }
+        }
+    }
+
+    private upsertWorker(registration: PatchwalkWorkerRegistration): RegisteredWorker {
+        const existingWorker = this.workers.get(registration.workerId);
+        if (existingWorker) {
+            // Re-registration is normal after a daemon restart or workspace-folder change.
+            existingWorker.processId = registration.processId;
+            existingWorker.extensionVersion = registration.extensionVersion;
+            existingWorker.workspaceRoots = registration.workspaceRoots;
+            existingWorker.lastSeenAt = registration.lastSeenAt;
+            return existingWorker;
+        }
+
+        const registeredWorker: RegisteredWorker = {
+            workerId: registration.workerId,
+            processId: registration.processId,
+            extensionVersion: registration.extensionVersion,
+            workspaceRoots: registration.workspaceRoots,
+            registeredAt: new Date().toISOString(),
+            registeredSequence: ++this.workerSequence,
+            lastSeenAt: registration.lastSeenAt,
+            pendingEvents: [],
+        };
+        this.workers.set(registeredWorker.workerId, registeredWorker);
+        return registeredWorker;
+    }
+
+    private async normalizeWorkerRegistration(
+        registration: PatchwalkWorkerRegistration,
+    ): Promise<PatchwalkWorkerRegistration> {
+        return {
+            ...registration,
+            workspaceRoots: await normalizeWorkspaceRoots(registration.workspaceRoots),
+        };
+    }
+
+    private async normalizeWorkerHeartbeat(
+        heartbeat: PatchwalkWorkerHeartbeat,
+    ): Promise<PatchwalkWorkerHeartbeat> {
+        return {
+            ...heartbeat,
+            workspaceRoots: await normalizeWorkspaceRoots(heartbeat.workspaceRoots),
+        };
+    }
+
+    private async normalizePayload(
+        payload: PatchwalkHandoffPayload,
+    ): Promise<PatchwalkHandoffPayload> {
+        return {
+            ...payload,
+            // Normalize once here so routing and status never disagree about path identity.
+            basePath: await normalizeAbsolutePath(payload.basePath),
         };
     }
 
@@ -646,9 +1301,6 @@ export class PatchwalkMcpServer {
             return;
         }
 
-        this.options.outputChannel.appendLine(
-            'Patchwalk MCP session failed before a session ID was assigned. Cleaning up orphaned session.',
-        );
         await this.closeSession(session);
     }
 
@@ -663,9 +1315,6 @@ export class PatchwalkMcpServer {
         }
 
         await Promise.allSettled([session.transport.close(), session.server.close()]);
-        this.options.outputChannel.appendLine(
-            `Patchwalk MCP session stopped: ${session.id || '<pending>'}`,
-        );
     }
 
     private async readJsonBody(request: IncomingMessage): Promise<unknown> {
@@ -684,6 +1333,7 @@ export class PatchwalkMcpServer {
             bodyChunks.push(chunkBuffer);
         }
 
+        // Read the whole body before parsing so every route gets the same size and emptiness checks.
         const rawBody = Buffer.concat(bodyChunks).toString('utf8');
         if (!rawBody.trim()) {
             throw new Error('Request body is empty.');

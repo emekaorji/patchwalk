@@ -1,3 +1,4 @@
+import path from 'node:path';
 import process from 'node:process';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -11,11 +12,16 @@ import {
 } from '../src/mcpCatalog';
 import type { PatchwalkHandoffPayload } from '../src/schema';
 
+/**
+ * Manual smoke test for the full daemon flow: inspect the MCP surface, then send a long narrated
+ * walkthrough into the dedicated test workspace.
+ */
 type WalkthroughTargetType = 'line' | 'range' | 'symbol';
 
-const port = Number(process.env.PATCHWALK_MCP_PORT ?? '7357');
+const port = Number(process.env.PATCHWALK_DAEMON_PORT ?? process.env.PATCHWALK_MCP_PORT ?? '7357');
 const baseUrl = `http://127.0.0.1:${port}`;
 const endpointUrl = `${baseUrl}/mcp`;
+const sampleBasePath = path.resolve(__dirname, '../test-workspace');
 
 interface SampleWalkthroughStep {
     id: string;
@@ -30,6 +36,9 @@ interface SampleWalkthroughStep {
     };
 }
 
+/**
+ * Helper keeps the hand-authored walkthrough readable without sacrificing stable ids.
+ */
 const createStep = (
     stepNumber: number,
     title: string,
@@ -561,10 +570,12 @@ const walkthrough: SampleWalkthroughStep[] = [
     ),
 ];
 
+// Route the sample walkthrough into the dedicated manual-test workspace.
 const samplePayload: PatchwalkHandoffPayload = {
     specVersion: '1.0.0',
     handoffId: `sample-demo-${new Date().toISOString()}`,
     createdAt: new Date().toISOString(),
+    basePath: sampleBasePath,
     producer: {
         agent: 'codex',
         agentVersion: '1.0.0',
@@ -598,6 +609,7 @@ const main = async (): Promise<void> => {
     try {
         await client.connect(transport);
 
+        // Print the whole surface first so manual testers can spot protocol regressions quickly.
         console.log('serverInfo:', client.getServerVersion());
         console.log('capabilities:', client.getServerCapabilities());
         console.log('sessionId:', transport.sessionId ?? null);

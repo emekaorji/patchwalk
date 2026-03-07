@@ -2,12 +2,14 @@ import { match, strictEqual } from 'node:assert';
 
 import { patchwalkHandoffPayloadSchema, validatePatchwalkPayload } from '../src/schema';
 
+// The public handoff schema is shared across MCP callers, the daemon, and workers.
 describe('patchwalk schema', () => {
     it('accepts a valid handoff payload', () => {
         const payload = {
             specVersion: '1.0.0',
             handoffId: 'demo-1',
             createdAt: '2026-03-06T00:00:00Z',
+            basePath: '/Users/example/project',
             producer: {
                 agent: 'codex',
                 agentVersion: '1.0.0',
@@ -46,6 +48,7 @@ describe('patchwalk schema', () => {
             specVersion: '1.0.0',
             handoffId: 'demo-2',
             createdAt: '2026-03-06T00:00:00Z',
+            basePath: '/Users/example/project',
             producer: {
                 agent: 'codex',
             },
@@ -75,6 +78,7 @@ describe('patchwalk schema', () => {
             specVersion: '1.0.0',
             handoffId: 'demo-3',
             createdAt: '2026-03-06T00:00:00Z',
+            basePath: '/Users/example/project',
             producer: {
                 agent: 'codex',
                 extra: 'nope',
@@ -105,6 +109,7 @@ describe('patchwalk schema', () => {
             specVersion: '1.0.0',
             handoffId: 'demo-4',
             createdAt: '2026-03-06T00:00:00Z',
+            basePath: '/Users/example/project',
             producer: {
                 agent: 'codex',
             },
@@ -115,6 +120,36 @@ describe('patchwalk schema', () => {
         strictEqual(result.ok, false);
         if (!result.ok) {
             match(result.error, /walkthrough/);
+        }
+    });
+
+    it('rejects relative base paths', () => {
+        const result = validatePatchwalkPayload({
+            specVersion: '1.0.0',
+            handoffId: 'demo-5',
+            createdAt: '2026-03-06T00:00:00Z',
+            basePath: 'project',
+            producer: {
+                agent: 'codex',
+            },
+            summary: 'Bad walkthrough.',
+            walkthrough: [
+                {
+                    id: 'step-1',
+                    title: 'Open file',
+                    narration: 'Patchwalk is highlighting this range.',
+                    path: 'src/extension.ts',
+                    range: {
+                        startLine: 1,
+                        endLine: 20,
+                    },
+                },
+            ],
+        });
+
+        strictEqual(result.ok, false);
+        if (!result.ok) {
+            match(result.error, /basePath/);
         }
     });
 });
