@@ -1,5 +1,6 @@
 import process from 'node:process';
 
+import * as logger from './logger';
 import { PatchwalkMcpServer } from './mcpServer';
 
 /**
@@ -27,29 +28,52 @@ const readDaemonPort = (): number => {
 };
 
 const main = async (): Promise<void> => {
-    // Create the singleton daemon for this process and then keep Node alive on the HTTP listener.
-    const server = new PatchwalkMcpServer({
-        port: readDaemonPort(),
+    const daemonPort = readDaemonPort();
+    logger.info('Patchwalk daemon bootstrap started.', {
+        pid: process.pid,
+        configuredPort: daemonPort,
     });
 
-    const stopServer = async () => {
+    // Create the singleton daemon for this process and then keep Node alive on the HTTP listener.
+    const server = new PatchwalkMcpServer({
+        port: daemonPort,
+    });
+
+    let stopPromise: Promise<void> | undefined;
+    const stopServer = async (reason: string): Promise<void> => {
+        if (stopPromise) {
+            return stopPromise;
+        }
+
         // Shutdown logic is shared by both signal handlers so the close path stays consistent.
-        await server.stop();
+        stopPromise = (async () => {
+            logger.info('Patchwalk daemon shutdown requested.', { reason });
+            await server.stop();
+            logger.info('Patchwalk daemon stopped.');
+            await logger.close();
+        })();
+        await stopPromise;
     };
 
     // The daemon keeps shutdown logic simple: stop accepting work and let Node exit.
     process.once('SIGINT', () => {
-        stopServer().catch((error: unknown) => {
+        stopServer('SIGINT').catch((error: unknown) => {
+            logger.error('Patchwalk daemon failed to stop cleanly after SIGINT.', error);
             console.error(error);
         });
     });
     process.once('SIGTERM', () => {
-        stopServer().catch((error: unknown) => {
+        stopServer('SIGTERM').catch((error: unknown) => {
+            logger.error('Patchwalk daemon failed to stop cleanly after SIGTERM.', error);
             console.error(error);
         });
     });
 
     await server.start();
+    logger.info('Patchwalk daemon is accepting requests.', {
+        endpointUrl: server.endpointUrl ?? null,
+        listeningPort: server.listeningPort ?? daemonPort,
+    });
 };
 
 main().catch((error) => {

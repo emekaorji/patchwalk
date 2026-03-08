@@ -2,6 +2,7 @@ out
 node_modules
 .vscode-test/
 *.vsix
+*logs.txt
 
 # esbuild-visualizer
 meta.json

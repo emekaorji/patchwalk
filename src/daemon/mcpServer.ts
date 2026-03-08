@@ -51,6 +51,7 @@ import { normalizeAbsolutePath } from '../lib/pathUtils';
 import type { PatchwalkWorkerClaimSummary } from '../lib/routing';
 import { compareWorkerClaims } from '../lib/routing';
 import type { PatchwalkHandoffPayload } from '../lib/schema';
+import * as logger from './logger';
 
 /**
  * The daemon owns two related protocols:
@@ -278,6 +279,7 @@ export class PatchwalkMcpServer {
     public async start(): Promise<void> {
         if (this.server) {
             // Starting twice is harmless and keeps daemon recovery idempotent.
+            logger.info('Patchwalk daemon start skipped because the server is already running.');
             return;
         }
 
@@ -300,9 +302,14 @@ export class PatchwalkMcpServer {
         });
 
         this.startedAt = new Date().toISOString();
+        logger.info('Patchwalk daemon server started.', {
+            listeningPort: this.listeningPort ?? this.options.port,
+            endpointUrl: this.endpointUrl ?? null,
+        });
     }
 
     public async stop(): Promise<void> {
+        logger.info('Patchwalk daemon server shutdown started.');
         // Stop sessions, workers, and in-flight dispatches in that order so callers fail deterministically.
         const sessionIds = [...this.sessions.keys()];
         await Promise.allSettled(sessionIds.map((sessionId) => this.disposeSession(sessionId)));
@@ -322,6 +329,7 @@ export class PatchwalkMcpServer {
 
         if (!this.server) {
             this.startedAt = null;
+            logger.info('Patchwalk daemon stop skipped because no HTTP server was active.');
             return;
         }
 
@@ -338,12 +346,35 @@ export class PatchwalkMcpServer {
 
         this.server = undefined;
         this.startedAt = null;
+        logger.info('Patchwalk daemon server shutdown finished.');
     }
 
     private async handleHttpRequestSafely(
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
+        const method = request.method ?? 'UNKNOWN';
+        const requestPath = getRequestPath(request);
+        const requestStartedAt = Date.now();
+        const shouldLogRequest =
+            requestPath !== HEALTH_PATH &&
+            !(requestPath.startsWith(`${WORKERS_PATH}/`) && requestPath.endsWith('/events'));
+
+        if (shouldLogRequest) {
+            logger.info('Incoming daemon HTTP request.', {
+                method,
+                path: requestPath,
+            });
+            response.once('finish', () => {
+                logger.info('Completed daemon HTTP request.', {
+                    method,
+                    path: requestPath,
+                    statusCode: response.statusCode,
+                    durationMs: Date.now() - requestStartedAt,
+                });
+            });
+        }
+
         try {
             await this.handleHttpRequest(request, response);
         } catch (error) {
@@ -362,6 +393,11 @@ export class PatchwalkMcpServer {
             }
 
             if (error instanceof Error) {
+                logger.error('Unhandled daemon HTTP request failure.', {
+                    method,
+                    path: requestPath,
+                    error: error.stack ?? error.message,
+                });
                 console.error(error);
             }
         }
@@ -390,6 +426,7 @@ export class PatchwalkMcpServer {
         }
 
         if (request.method === 'POST' && requestPath === DAEMON_SHUTDOWN_PATH) {
+            logger.info('Received daemon shutdown HTTP request.');
             this.writeJsonResponse(response, 202, {
                 ok: true,
                 message: 'Patchwalk daemon shutdown requested.',
@@ -398,6 +435,7 @@ export class PatchwalkMcpServer {
             setImmediate(() => {
                 // Respond first so callers do not race the process shutdown path.
                 this.stop().catch((error: unknown) => {
+                    logger.error('Daemon shutdown endpoint failed to stop the server.', error);
                     console.error(error);
                 });
             });
@@ -456,6 +494,10 @@ export class PatchwalkMcpServer {
             await this.readJsonBody(request),
         );
         if (!parsedBody.success) {
+            logger.warn('Worker registration rejected because the payload was invalid.', {
+                reason:
+                    parsedBody.error.issues[0]?.message ?? 'Invalid worker registration payload.',
+            });
             this.writeJsonResponse(response, 400, {
                 error:
                     parsedBody.error.issues[0]?.message ?? 'Invalid worker registration payload.',
@@ -472,6 +514,11 @@ export class PatchwalkMcpServer {
             daemonPid: process.pid,
             pollIntervalMs: PATCHWALK_DEFAULT_POLL_INTERVAL_MS,
             heartbeatIntervalMs: PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS,
+        });
+        logger.info('Worker registration accepted.', {
+            workerId: registeredWorker.workerId,
+            processId: registeredWorker.processId,
+            workspaceRootCount: registeredWorker.workspaceRoots.length,
         });
         this.writeJsonResponse(response, 200, registrationResponse);
     }
@@ -543,6 +590,10 @@ export class PatchwalkMcpServer {
             await this.readJsonBody(request),
         );
         if (!parsedBody.success) {
+            logger.warn('Worker heartbeat rejected because the payload was invalid.', {
+                workerId: worker.workerId,
+                reason: parsedBody.error.issues[0]?.message ?? 'Invalid worker heartbeat payload.',
+            });
             this.writeJsonResponse(response, 400, {
                 error: parsedBody.error.issues[0]?.message ?? 'Invalid worker heartbeat payload.',
             });
@@ -583,6 +634,10 @@ export class PatchwalkMcpServer {
         // Claims arrive during the short claim window after a playback request is broadcast.
         const parsedBody = patchwalkWorkerClaimSchema.safeParse(await this.readJsonBody(request));
         if (!parsedBody.success) {
+            logger.warn('Worker claim rejected because the payload was invalid.', {
+                workerId: worker.workerId,
+                reason: parsedBody.error.issues[0]?.message ?? 'Invalid worker claim payload.',
+            });
             this.writeJsonResponse(response, 400, {
                 error: parsedBody.error.issues[0]?.message ?? 'Invalid worker claim payload.',
             });
@@ -610,6 +665,13 @@ export class PatchwalkMcpServer {
             },
         ];
 
+        logger.info('Worker claim accepted for active dispatch.', {
+            workerId: worker.workerId,
+            dispatchId: dispatch.dispatchId,
+            matchKind: claim.matchKind,
+            matchedRoot: claim.matchedRoot,
+        });
+
         this.writeJsonResponse(response, 202, { ok: true });
     }
 
@@ -621,6 +683,10 @@ export class PatchwalkMcpServer {
         // Results arrive only from the single selected worker once playback succeeds or fails.
         const parsedBody = patchwalkWorkerResultSchema.safeParse(await this.readJsonBody(request));
         if (!parsedBody.success) {
+            logger.warn('Worker result rejected because the payload was invalid.', {
+                workerId: worker.workerId,
+                reason: parsedBody.error.issues[0]?.message ?? 'Invalid worker result payload.',
+            });
             this.writeJsonResponse(response, 400, {
                 error: parsedBody.error.issues[0]?.message ?? 'Invalid worker result payload.',
             });
@@ -630,6 +696,10 @@ export class PatchwalkMcpServer {
         const result = parsedBody.data;
         const dispatch = this.activeDispatches.get(result.dispatchId);
         if (!dispatch || dispatch.selectedWorkerId !== worker.workerId) {
+            logger.warn('Worker result rejected because no matching active dispatch was found.', {
+                workerId: worker.workerId,
+                dispatchId: result.dispatchId,
+            });
             this.writeJsonResponse(response, 404, {
                 error: 'Dispatch not found for worker result.',
             });
@@ -638,6 +708,12 @@ export class PatchwalkMcpServer {
 
         // Results are the handoff between editor-side playback and the MCP tool response.
         if (result.status === 'completed') {
+            logger.info('Worker reported completed playback.', {
+                workerId: worker.workerId,
+                dispatchId: result.dispatchId,
+                handoffId: result.handoffId,
+                stepsPlayed: result.stepsPlayed,
+            });
             dispatch.resolveResult({
                 workerId: worker.workerId,
                 matchedRoot: dispatch.selectedMatchedRoot ?? dispatch.payload.basePath,
@@ -645,6 +721,12 @@ export class PatchwalkMcpServer {
                 stepsPlayed: result.stepsPlayed!,
             });
         } else {
+            logger.error('Worker reported failed playback.', {
+                workerId: worker.workerId,
+                dispatchId: result.dispatchId,
+                handoffId: result.handoffId,
+                error: result.error,
+            });
             dispatch.rejectResult(new Error(result.error));
         }
 
@@ -662,6 +744,9 @@ export class PatchwalkMcpServer {
         } catch (error) {
             const message =
                 error instanceof Error ? error.message : 'Request body could not be parsed.';
+            logger.warn('Rejected MCP POST request because JSON parsing failed.', {
+                reason: message,
+            });
             this.writeJsonResponse(
                 response,
                 400,
@@ -674,6 +759,9 @@ export class PatchwalkMcpServer {
         if (sessionId) {
             const session = this.sessions.get(sessionId);
             if (!session) {
+                logger.warn('Rejected MCP POST request because the session id was unknown.', {
+                    sessionId,
+                });
                 this.writeJsonResponse(
                     response,
                     400,
@@ -689,6 +777,7 @@ export class PatchwalkMcpServer {
 
         if (!isInitializeRequest(parsedBody)) {
             // Clients must initialize before making any session-bound MCP requests.
+            logger.warn('Rejected MCP POST request because initialize was not called first.');
             this.writeJsonResponse(
                 response,
                 400,
@@ -714,6 +803,7 @@ export class PatchwalkMcpServer {
         // GET and DELETE requests are meaningful only after a session already exists.
         const sessionId = getSessionId(request);
         if (!sessionId) {
+            logger.warn('Rejected MCP session-bound request without a session id header.');
             this.writeJsonResponse(
                 response,
                 400,
@@ -724,6 +814,9 @@ export class PatchwalkMcpServer {
 
         const session = this.sessions.get(sessionId);
         if (!session) {
+            logger.warn('Rejected MCP session-bound request with an unknown session id.', {
+                sessionId,
+            });
             this.writeJsonResponse(
                 response,
                 400,
@@ -746,6 +839,11 @@ export class PatchwalkMcpServer {
             await session.transport.handleRequest(request, response, parsedBody);
         } catch {
             // Keep SDK transport failures inside the daemon boundary.
+            logger.error('MCP transport failed to handle a request.', {
+                sessionId: session.id || null,
+                method: request.method ?? 'UNKNOWN',
+                path: getRequestPath(request),
+            });
             if (!response.headersSent) {
                 this.writeJsonResponse(
                     response,
@@ -774,8 +872,13 @@ export class PatchwalkMcpServer {
                 // Session ids are only known after the transport finishes initialize negotiation.
                 sessionRef.current.id = sessionId;
                 this.sessions.set(sessionId, sessionRef.current);
+                logger.info('MCP session initialized.', {
+                    sessionId,
+                    activeSessionCount: this.sessions.size,
+                });
             },
             onsessionclosed: (sessionId) => {
+                logger.info('MCP session closed by transport.', { sessionId });
                 return this.disposeSession(sessionId);
             },
         });
@@ -792,6 +895,7 @@ export class PatchwalkMcpServer {
             transport,
         };
         sessionRef.current = session;
+        logger.info('MCP session created and awaiting initialize handshake.');
 
         return session;
     }
@@ -958,6 +1062,11 @@ export class PatchwalkMcpServer {
                 const session = getSession();
 
                 // Logging messages give MCP-aware clients progress visibility during long playbacks.
+                logger.info('MCP tool call started playback routing.', {
+                    handoffId: payload.handoffId,
+                    basePath: payload.basePath,
+                    sessionId: extra.sessionId ?? null,
+                });
                 await server.sendLoggingMessage(
                     {
                         level: 'info',
@@ -969,6 +1078,12 @@ export class PatchwalkMcpServer {
                 try {
                     const dispatchResult = await this.dispatchPlayback(payload);
 
+                    logger.info('MCP tool call completed playback routing.', {
+                        handoffId: payload.handoffId,
+                        workerId: dispatchResult.workerId,
+                        matchedRoot: dispatchResult.matchedRoot,
+                        sessionId: extra.sessionId ?? null,
+                    });
                     await server.sendLoggingMessage(
                         {
                             level: 'info',
@@ -1000,6 +1115,11 @@ export class PatchwalkMcpServer {
                     };
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error);
+                    logger.error('MCP tool call failed during playback routing.', {
+                        handoffId: payload.handoffId,
+                        sessionId: extra.sessionId ?? null,
+                        error: message,
+                    });
 
                     await server.sendLoggingMessage(
                         {
@@ -1117,6 +1237,12 @@ export class PatchwalkMcpServer {
             rejectResult: resultState.reject!,
         };
         this.activeDispatches.set(dispatch.dispatchId, dispatch);
+        logger.info('Dispatch created for playback request.', {
+            dispatchId: dispatch.dispatchId,
+            handoffId: payload.handoffId,
+            basePath: payload.basePath,
+            registeredWorkerCount: this.workers.size,
+        });
 
         try {
             // Broadcast only the minimal claim payload first; the full handoff waits for the winner.
@@ -1137,6 +1263,11 @@ export class PatchwalkMcpServer {
             // Winner selection is deterministic and centralized in the daemon.
             const selectedClaim = [...dispatch.claims].sort(compareWorkerClaims)[0];
             if (!selectedClaim) {
+                logger.warn('Dispatch failed because no worker claimed the requested base path.', {
+                    dispatchId: dispatch.dispatchId,
+                    handoffId: payload.handoffId,
+                    basePath: payload.basePath,
+                });
                 throw new Error(
                     `No live Patchwalk window matched the requested basePath: ${payload.basePath}`,
                 );
@@ -1145,6 +1276,12 @@ export class PatchwalkMcpServer {
             dispatch.state = 'executing';
             dispatch.selectedWorkerId = selectedClaim.workerId;
             dispatch.selectedMatchedRoot = selectedClaim.matchedRoot;
+            logger.info('Dispatch selected worker claim.', {
+                dispatchId: dispatch.dispatchId,
+                workerId: selectedClaim.workerId,
+                matchedRoot: selectedClaim.matchedRoot,
+                matchKind: selectedClaim.matchKind,
+            });
 
             // Let losing workers clear any pending local state for this dispatch.
             for (const claim of dispatch.claims) {
@@ -1176,6 +1313,10 @@ export class PatchwalkMcpServer {
         } finally {
             // Dispatches are purely in-memory and disappear once the tool call resolves.
             this.activeDispatches.delete(dispatch.dispatchId);
+            logger.info('Dispatch removed from active registry.', {
+                dispatchId: dispatch.dispatchId,
+                remainingActiveDispatches: this.activeDispatches.size,
+            });
         }
     }
 
@@ -1251,6 +1392,10 @@ export class PatchwalkMcpServer {
         }
 
         this.workers.delete(workerId);
+        logger.info('Worker removed from daemon registry.', {
+            workerId,
+            remainingWorkerCount: this.workers.size,
+        });
     }
 
     private pruneStaleWorkers(): void {
@@ -1259,6 +1404,10 @@ export class PatchwalkMcpServer {
         for (const worker of this.workers.values()) {
             const ageMs = now - new Date(worker.lastSeenAt).getTime();
             if (ageMs > STALE_WORKER_TIMEOUT_MS) {
+                logger.warn('Pruning stale worker from daemon registry.', {
+                    workerId: worker.workerId,
+                    ageMs,
+                });
                 this.disposeWorker(worker.workerId);
             }
         }
@@ -1272,6 +1421,10 @@ export class PatchwalkMcpServer {
             existingWorker.extensionVersion = registration.extensionVersion;
             existingWorker.workspaceRoots = registration.workspaceRoots;
             existingWorker.lastSeenAt = registration.lastSeenAt;
+            logger.info('Worker registration refreshed existing worker record.', {
+                workerId: existingWorker.workerId,
+                workspaceRootCount: existingWorker.workspaceRoots.length,
+            });
             return existingWorker;
         }
 
@@ -1287,6 +1440,11 @@ export class PatchwalkMcpServer {
         };
         // Registration sequence becomes the final deterministic tie-break when paths are otherwise equal.
         this.workers.set(registeredWorker.workerId, registeredWorker);
+        logger.info('Worker registration created new worker record.', {
+            workerId: registeredWorker.workerId,
+            processId: registeredWorker.processId,
+            registrationSequence: registeredWorker.registeredSequence,
+        });
         return registeredWorker;
     }
 
@@ -1347,6 +1505,10 @@ export class PatchwalkMcpServer {
         }
 
         await Promise.allSettled([session.transport.close(), session.server.close()]);
+        logger.info('MCP session resources disposed.', {
+            sessionId: session.id || null,
+            activeSessionCount: this.sessions.size,
+        });
     }
 
     private async readJsonBody(request: IncomingMessage): Promise<unknown> {
