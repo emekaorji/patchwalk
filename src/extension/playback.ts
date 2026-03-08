@@ -2,7 +2,7 @@ import path from 'node:path';
 
 import * as vscode from 'vscode';
 
-import type { PatchwalkHandoffPayload, PatchwalkWalkthroughStep } from './schema';
+import type { PatchwalkHandoffPayload, PatchwalkWalkthroughStep } from '../lib/schema';
 import { speakWithSystemVoice } from './tts';
 
 /**
@@ -17,6 +17,7 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
     private playbackQueue: Promise<void> = Promise.resolve();
 
     public constructor(private readonly outputChannel: vscode.OutputChannel) {
+        // Reuse one decoration type so every step highlight looks identical across playbacks.
         this.highlightDecoration = vscode.window.createTextEditorDecorationType({
             isWholeLine: true,
             backgroundColor: new vscode.ThemeColor('editor.rangeHighlightBackground'),
@@ -24,10 +25,12 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
     }
 
     public dispose() {
+        // Decorations are editor resources and should be released with the extension host.
         this.highlightDecoration.dispose();
     }
 
     public play(payload: PatchwalkHandoffPayload): Promise<void> {
+        // Queueing prevents multiple handoffs from fighting over focus, selections, and narration.
         this.playbackQueue = this.playbackQueue
             .catch(() => {
                 // Keep queue operational after a failed playback.
@@ -86,6 +89,7 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
             preserveFocus: false,
         });
 
+        // Clamp authored line ranges so out-of-date payloads do not explode on shorter files.
         const maximumLine = Math.max(document.lineCount - 1, 0);
         const startLine = Math.min(Math.max(step.range.startLine - 1, 0), maximumLine);
         const endLine = Math.min(Math.max(step.range.endLine - 1, startLine), maximumLine);
@@ -124,6 +128,7 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
             await speakWithSystemVoice(text);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            // Narration failure should not prevent the editor walkthrough from finishing.
             this.outputChannel.appendLine(`TTS error: ${message}`);
             await vscode.window.showWarningMessage(
                 `Patchwalk TTS unavailable, skipping narration: ${message}`,

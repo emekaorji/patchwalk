@@ -7,6 +7,7 @@ import process from 'node:process';
  */
 const runCommand = (command: string, args: string[]): Promise<void> => {
     return new Promise((resolve, reject) => {
+        // Spawn per utterance keeps the implementation dependency-free and easy to reason about.
         const childProcess = spawn(command, args, {
             stdio: ['ignore', 'ignore', 'pipe'],
         });
@@ -38,6 +39,7 @@ const normalizeText = (text: string): string => {
 };
 
 export const speakWithSystemVoice = async (text: string): Promise<void> => {
+    // Empty or whitespace-only narration should be a no-op, not a platform call.
     const normalizedText = normalizeText(text);
     if (!normalizedText) {
         return;

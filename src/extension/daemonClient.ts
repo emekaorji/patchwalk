@@ -11,15 +11,15 @@ import type {
     PatchwalkWorkerRegistration,
     PatchwalkWorkerRegistrationResponse,
     PatchwalkWorkerResult,
-} from './controlProtocol';
+} from '../lib/controlProtocol';
 import {
     patchwalkWorkerClaimSchema,
     patchwalkWorkerEventsResponseSchema,
     patchwalkWorkerRegistrationResponseSchema,
-} from './controlProtocol';
-import type { PatchwalkStatusResource } from './mcpCatalog';
-import { PATCHWALK_PLAY_TOOL_NAME, PATCHWALK_STATUS_RESOURCE_URI } from './mcpCatalog';
-import type { PatchwalkHandoffPayload } from './schema';
+} from '../lib/controlProtocol';
+import type { PatchwalkStatusResource } from '../lib/mcpCatalog';
+import { PATCHWALK_PLAY_TOOL_NAME, PATCHWALK_STATUS_RESOURCE_URI } from '../lib/mcpCatalog';
+import type { PatchwalkHandoffPayload } from '../lib/schema';
 
 /**
  * The extension talks to the daemon through this small client wrapper so the worker controller does
@@ -54,6 +54,7 @@ export class PatchwalkDaemonClient {
     public constructor(private readonly options: PatchwalkDaemonClientOptions) {}
 
     public get baseUrl(): string {
+        // All extension-to-daemon traffic stays on localhost so no external broker is required.
         return `http://127.0.0.1:${this.options.port}`;
     }
 
@@ -66,6 +67,7 @@ export class PatchwalkDaemonClient {
             return;
         }
 
+        // Windows race safely here: only one process can bind the port and the rest reconnect.
         // Spawn detached so the daemon survives extension-host restarts and reloads.
         const childProcess = spawn(
             process.execPath,
@@ -85,6 +87,7 @@ export class PatchwalkDaemonClient {
     }
 
     public async fetchHealth(): Promise<PatchwalkHealthResponse> {
+        // Health is the cheapest possible probe and avoids opening a full MCP session.
         return this.requestJson<PatchwalkHealthResponse>('/health', {
             method: 'GET',
         });
@@ -93,6 +96,7 @@ export class PatchwalkDaemonClient {
     public async registerWorker(
         registration: PatchwalkWorkerRegistration,
     ): Promise<PatchwalkWorkerRegistrationResponse> {
+        // Registration establishes worker ownership metadata and refreshes it after reconnects.
         const response = await this.requestJson('/workers', {
             method: 'POST',
             body: JSON.stringify(registration),
@@ -111,6 +115,7 @@ export class PatchwalkDaemonClient {
     }
 
     public async pollEvents(workerId: string, waitMs: number): Promise<PatchwalkWorkerEvent[]> {
+        // Long-polling keeps the control protocol simple without requiring a separate socket transport.
         const response = await this.requestJson(`/workers/${workerId}/events?waitMs=${waitMs}`, {
             method: 'GET',
         });
@@ -133,6 +138,7 @@ export class PatchwalkDaemonClient {
     }
 
     public async shutdown(): Promise<void> {
+        // Shutdown is used only by operator commands and tests.
         await this.requestJson('/daemon/shutdown', {
             method: 'POST',
         });
@@ -194,6 +200,7 @@ export class PatchwalkDaemonClient {
             const health = await this.fetchHealth();
             return health.ok;
         } catch {
+            // Connection errors are normal while the daemon is still starting.
             return false;
         }
     }
@@ -207,6 +214,7 @@ export class PatchwalkDaemonClient {
             return;
         }
 
+        // Keep retry intervals short so activation feels immediate after a cold start.
         await new Promise((resolve) => {
             setTimeout(resolve, 150);
         });
@@ -221,6 +229,7 @@ export class PatchwalkDaemonClient {
             body?: string;
         },
     ): Promise<T> {
+        // Every daemon call gets a timeout so broken local networking does not wedge the extension host.
         const controller = createTimeoutController(10_000);
         const response = await fetch(`${this.baseUrl}${requestPath}`, {
             method: options.method,

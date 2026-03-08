@@ -8,6 +8,7 @@ import { patchwalkHandoffPayloadSchema } from './schema';
  * public MCP surface.
  */
 const nonEmptyStringSchema = z.string().min(1).regex(/\S/, 'must not be blank.');
+// IDs, process ids, and interval values are always positive integers in this transport.
 const positiveIntegerSchema = z.number().int().gte(1);
 
 // Version the private worker protocol separately from the public handoff schema.
@@ -91,6 +92,7 @@ export const patchwalkWorkerClaimSchema = z
         matchKind: z.enum(['exact', 'parent']).optional(),
     })
     .superRefine((value, context) => {
+        // Accepted claims must carry enough information for the daemon to rank them centrally.
         if (value.accepted && (!value.matchedRoot || !value.matchKind)) {
             context.addIssue({
                 code: z.ZodIssueCode.custom,
@@ -118,6 +120,7 @@ export const patchwalkWorkerResultSchema = z
         error: nonEmptyStringSchema.optional(),
     })
     .superRefine((value, context) => {
+        // Completed and failed results intentionally have different required fields.
         if (value.status === 'completed' && value.stepsPlayed === undefined) {
             context.addIssue({
                 code: z.ZodIssueCode.custom,

@@ -9,17 +9,17 @@ import type {
     PatchwalkPlaybackClaimEvent,
     PatchwalkPlaybackExecuteEvent,
     PatchwalkWorkerEvent,
-} from './controlProtocol';
+} from '../lib/controlProtocol';
 import {
     PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS,
     PATCHWALK_DEFAULT_POLL_INTERVAL_MS,
     PATCHWALK_WORKER_API_VERSION,
-} from './controlProtocol';
+} from '../lib/controlProtocol';
+import { normalizeAbsolutePath } from '../lib/pathUtils';
+import { matchBasePathToWorkspaceRoots } from '../lib/routing';
+import type { PatchwalkHandoffPayload } from '../lib/schema';
 import { PatchwalkDaemonClient } from './daemonClient';
-import { normalizeAbsolutePath } from './pathUtils';
 import type { PatchwalkPlaybackRunner } from './playback';
-import { matchBasePathToWorkspaceRoots } from './routing';
-import type { PatchwalkHandoffPayload } from './schema';
 
 /**
  * The worker controller is the extension-side control plane. It keeps the daemon alive, registers
@@ -33,6 +33,9 @@ interface PatchwalkWorkerControllerOptions {
 }
 
 export class PatchwalkWorkerController implements vscode.Disposable {
+    /**
+     * Every window gets its own stable worker id so the daemon can track it across heartbeats.
+     */
     private readonly workerId = randomUUID();
     private readonly daemonClient: PatchwalkDaemonClient;
     private readonly disposables: vscode.Disposable[] = [];
@@ -47,13 +50,21 @@ export class PatchwalkWorkerController implements vscode.Disposable {
     private pollIntervalMs = PATCHWALK_DEFAULT_POLL_INTERVAL_MS;
 
     public constructor(private readonly options: PatchwalkWorkerControllerOptions) {
+        // The extension always spawns the bundled daemon artifact rather than assuming a global install.
         this.daemonClient = new PatchwalkDaemonClient({
-            daemonEntryPath: path.join(options.context.extensionPath, 'out', 'src', 'daemon.js'),
+            daemonEntryPath: path.join(
+                options.context.extensionPath,
+                'out',
+                'src',
+                'daemon',
+                'index.js',
+            ),
             port: options.daemonPort,
         });
     }
 
     public async start(): Promise<void> {
+        // Registration happens first so the window can participate in routing before polling starts.
         await this.ensureConnected();
 
         this.disposables.push(
@@ -91,6 +102,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
     }
 
     public async stopDaemon(): Promise<void> {
+        // This is a deliberate debug escape hatch, so also pause the self-healing behavior.
         this.daemonManagementEnabled = false;
         if (this.heartbeatTimer) {
             clearInterval(this.heartbeatTimer);
@@ -106,6 +118,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
     }
 
     public dispose(): void {
+        // Disposal only needs to stop timers and listeners; the daemon keeps running independently.
         this.stopping = true;
         if (this.heartbeatTimer) {
             clearInterval(this.heartbeatTimer);
@@ -122,6 +135,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
         }
 
         if (this.heartbeatTimer) {
+            // Timer cadence can change after registration, so replace any older interval.
             clearInterval(this.heartbeatTimer);
         }
 
@@ -152,6 +166,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
             return;
         }
 
+        // Health-check and auto-spawn are centralized inside the daemon client.
         await this.daemonClient.ensureServerRunning();
 
         const registration = await this.daemonClient.registerWorker({
@@ -171,6 +186,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
 
     private async refreshRegistration(): Promise<void> {
         try {
+            // Re-registering is cheap and doubles as a daemon-reconnect path.
             await this.ensureConnected();
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -239,12 +255,14 @@ export class PatchwalkWorkerController implements vscode.Disposable {
             ),
         );
 
+        // Sort roots so duplicate registrations are stable and easy to compare server-side.
         return [...new Set(normalizedRoots)].sort((leftRoot, rightRoot) =>
             leftRoot.localeCompare(rightRoot),
         );
     }
 
     private async handleEvent(event: PatchwalkWorkerEvent): Promise<void> {
+        // Worker events are intentionally exhaustive so unexpected daemon messages fail at the type level.
         switch (event.type) {
             case 'playback.claim':
                 await this.handleClaimEvent(event);
@@ -262,6 +280,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
     }
 
     private async handleClaimEvent(event: PatchwalkPlaybackClaimEvent): Promise<void> {
+        // Workers decide only whether they can serve the base path, never whether they should win.
         const workspaceRoots = await this.collectWorkspaceRoots();
         const match = matchBasePathToWorkspaceRoots(event.basePath, workspaceRoots);
 
@@ -284,6 +303,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
 
     private async handleExecuteEvent(event: PatchwalkPlaybackExecuteEvent): Promise<void> {
         try {
+            // The actual editor-side side effects stay isolated inside the playback runner.
             await this.options.playbackRunner.play(event.payload);
             await this.daemonClient.submitResult(this.workerId, {
                 dispatchId: event.dispatchId,
@@ -293,6 +313,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
             });
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            // Report execution failures back to the daemon so the MCP caller receives a real error.
             await this.daemonClient.submitResult(this.workerId, {
                 dispatchId: event.dispatchId,
                 handoffId: event.payload.handoffId,

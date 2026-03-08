@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 
+import { validatePatchwalkPayload } from '../lib/schema';
 import { PatchwalkPlaybackRunner } from './playback';
-import { validatePatchwalkPayload } from './schema';
 import { PatchwalkWorkerController } from './workerController';
 
 /**
@@ -10,11 +10,13 @@ import { PatchwalkWorkerController } from './workerController';
  * this window.
  */
 function readDaemonPort(): number {
+    // Keep reading the legacy setting during migration so older user settings do not break startup.
     const configuration = vscode.workspace.getConfiguration('patchwalk');
     return configuration.get<number>('daemonPort', configuration.get<number>('mcpPort', 7357));
 }
 
 export function activate(context: vscode.ExtensionContext) {
+    // Activation wires together the local UX layer: output, playback, and daemon worker control.
     const outputChannel = vscode.window.createOutputChannel('Patchwalk');
     const playbackRunner = new PatchwalkPlaybackRunner(outputChannel);
     const daemonPort = readDaemonPort();
@@ -59,6 +61,7 @@ export function activate(context: vscode.ExtensionContext) {
     const playFromClipboardCommand = vscode.commands.registerCommand(
         'patchwalk.playFromClipboard',
         async () => {
+            // Clipboard playback stays useful for manual testing and must validate exactly like MCP.
             const clipboardText = await vscode.env.clipboard.readText();
             if (!clipboardText.trim()) {
                 await vscode.window.showErrorMessage('Clipboard is empty.');
@@ -99,5 +102,5 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-    // Disposables on the extension context perform cleanup.
+    // VS Code disposes registered resources for us, so there is no separate teardown logic here.
 }

@@ -1,6 +1,6 @@
 import { deepStrictEqual, strictEqual } from 'node:assert';
 
-import { compareWorkerClaims, matchBasePathToWorkspaceRoots } from '../src/routing';
+import { compareWorkerClaims, matchBasePathToWorkspaceRoots } from '../src/lib/routing';
 
 // These tests lock the deterministic winner-selection policy used by the daemon.
 describe('patchwalk routing', () => {

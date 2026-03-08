@@ -15,7 +15,7 @@ const isWatchMode = process.argv.includes('--watch');
 const options: BuildOptions = {
     color: true,
     logLevel: 'info',
-    entryPoints: ['src/extension.ts', 'src/daemon.ts'],
+    entryPoints: ['src/extension/index.ts', 'src/daemon/index.ts'],
     bundle: true,
     metafile: process.argv.includes('--metafile'),
     outdir: './out/src',

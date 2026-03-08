@@ -14,7 +14,7 @@ import type {
     PatchwalkWorkerEvent,
     PatchwalkWorkerHeartbeat,
     PatchwalkWorkerRegistration,
-} from './controlProtocol';
+} from '../lib/controlProtocol';
 import {
     PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS,
     PATCHWALK_DEFAULT_POLL_INTERVAL_MS,
@@ -23,12 +23,12 @@ import {
     patchwalkWorkerRegistrationResponseSchema,
     patchwalkWorkerRegistrationSchema,
     patchwalkWorkerResultSchema,
-} from './controlProtocol';
+} from '../lib/controlProtocol';
 import type {
     PatchwalkDispatchStatusResource,
     PatchwalkStatusResource,
     PatchwalkWorkerStatusResource,
-} from './mcpCatalog';
+} from '../lib/mcpCatalog';
 import {
     createPatchwalkAuthoringGuide,
     createPatchwalkComposePromptText,
@@ -46,11 +46,11 @@ import {
     PATCHWALK_STATUS_RESOURCE_URI,
     patchwalkPlayArgumentsSchema,
     patchwalkPlayResultSchema,
-} from './mcpCatalog';
-import { normalizeAbsolutePath } from './pathUtils';
-import type { PatchwalkWorkerClaimSummary } from './routing';
-import { compareWorkerClaims } from './routing';
-import type { PatchwalkHandoffPayload } from './schema';
+} from '../lib/mcpCatalog';
+import { normalizeAbsolutePath } from '../lib/pathUtils';
+import type { PatchwalkWorkerClaimSummary } from '../lib/routing';
+import { compareWorkerClaims } from '../lib/routing';
+import type { PatchwalkHandoffPayload } from '../lib/schema';
 
 /**
  * The daemon owns two related protocols:
@@ -88,6 +88,7 @@ interface PendingWorkerPoll {
     timeout: NodeJS.Timeout;
 }
 
+// Workers are tracked entirely in-memory because live windows can always re-register after reconnects.
 interface RegisteredWorker {
     workerId: string;
     processId: number;
@@ -128,6 +129,7 @@ const DAEMON_SHUTDOWN_PATH = '/daemon/shutdown';
 const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 25_000;
 const MAX_LONG_POLL_TIMEOUT_MS = 30_000;
+// The claim window is short so MCP callers do not pay a large routing penalty.
 const CLAIM_WINDOW_MS = 600;
 const EXECUTION_TIMEOUT_MS = 5 * 60_000;
 const STALE_WORKER_TIMEOUT_MS = 20_000;
@@ -151,6 +153,7 @@ const createJsonRpcErrorResponse = (
 };
 
 const getRequestUrl = (request: IncomingMessage): URL => {
+    // Request URLs are resolved against localhost because the daemon only serves local traffic.
     return new URL(request.url ?? '/', 'http://127.0.0.1');
 };
 
@@ -159,6 +162,7 @@ const getRequestPath = (request: IncomingMessage): string => {
 };
 
 const getSessionId = (request: IncomingMessage): string | undefined => {
+    // MCP session ids travel in a header after initialize negotiates them with the SDK transport.
     const headerValue = request.headers['mcp-session-id'];
     return typeof headerValue === 'string' && headerValue.length > 0 ? headerValue : undefined;
 };
@@ -214,6 +218,7 @@ const withTimeout = async <T>(
 };
 
 const normalizeWorkspaceRoots = async (workspaceRoots: string[]): Promise<string[]> => {
+    // Worker roots are normalized up front so routing never depends on symlinks or trailing slashes.
     const normalizedRoots = await Promise.all(
         workspaceRoots.map((workspaceRoot) => normalizeAbsolutePath(workspaceRoot)),
     );
@@ -247,6 +252,7 @@ export class PatchwalkMcpServer {
     public constructor(private readonly options: PatchwalkMcpServerOptions) {}
 
     public get endpointUrl(): string | undefined {
+        // Expose the resolved port because tests may boot the daemon on an ephemeral port.
         const port = this.listeningPort;
         if (port === undefined) {
             return undefined;
@@ -256,6 +262,7 @@ export class PatchwalkMcpServer {
     }
 
     public get listeningPort(): number | undefined {
+        // Node returns either a pipe string or an address object; Patchwalk only uses TCP.
         const address = this.server?.address();
         if (!address || typeof address === 'string') {
             return undefined;
@@ -270,6 +277,7 @@ export class PatchwalkMcpServer {
 
     public async start(): Promise<void> {
         if (this.server) {
+            // Starting twice is harmless and keeps daemon recovery idempotent.
             return;
         }
 
@@ -369,6 +377,7 @@ export class PatchwalkMcpServer {
         const requestPath = getRequestPath(request);
 
         if (request.method === 'GET' && requestPath === HEALTH_PATH) {
+            // Health is intentionally tiny and does not require MCP negotiation.
             this.writeJsonResponse(response, 200, {
                 ok: true,
                 endpointUrl: this.endpointUrl ?? null,
@@ -401,6 +410,7 @@ export class PatchwalkMcpServer {
         }
 
         if (requestPath === WORKERS_PATH && request.method === 'POST') {
+            // Worker registration is a plain local HTTP endpoint, not an MCP tool.
             await this.handleWorkerRegistration(request, response);
             return;
         }
@@ -417,6 +427,7 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
+        // Streamable HTTP uses POST for messages and GET/DELETE for session lifecycle.
         switch (request.method) {
             case 'POST':
                 await this.handlePostRequest(request, response);
@@ -440,6 +451,7 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
+        // Registration is validated before any worker touches the daemon registry.
         const parsedBody = patchwalkWorkerRegistrationSchema.safeParse(
             await this.readJsonBody(request),
         );
@@ -468,6 +480,7 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
+        // Worker routes are intentionally narrow so the private protocol stays easy to audit.
         const pathParts = getWorkerPathParts(getRequestPath(request));
         if (!pathParts || pathParts.length !== 2) {
             this.writeJsonResponse(response, 404, { error: 'Unknown worker endpoint.' });
@@ -525,6 +538,7 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
+        // Heartbeats double as workspace-root refreshes for already-registered windows.
         const parsedBody = patchwalkWorkerHeartbeatSchema.safeParse(
             await this.readJsonBody(request),
         );
@@ -548,6 +562,7 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
+        // Workers are allowed to suggest a wait time, but the daemon clamps it to sane bounds.
         const waitMsValue = Number(getRequestUrl(request).searchParams.get('waitMs') ?? '');
         const waitMs = Number.isFinite(waitMsValue)
             ? Math.min(Math.max(waitMsValue, 1), MAX_LONG_POLL_TIMEOUT_MS)
@@ -565,6 +580,7 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
+        // Claims arrive during the short claim window after a playback request is broadcast.
         const parsedBody = patchwalkWorkerClaimSchema.safeParse(await this.readJsonBody(request));
         if (!parsedBody.success) {
             this.writeJsonResponse(response, 400, {
@@ -602,6 +618,7 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
+        // Results arrive only from the single selected worker once playback succeeds or fails.
         const parsedBody = patchwalkWorkerResultSchema.safeParse(await this.readJsonBody(request));
         if (!parsedBody.success) {
             this.writeJsonResponse(response, 400, {
@@ -638,6 +655,7 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
+        // POST is the only MCP route that can create sessions and deliver client messages.
         let parsedBody: unknown;
         try {
             parsedBody = await this.readJsonBody(request);
@@ -670,6 +688,7 @@ export class PatchwalkMcpServer {
         }
 
         if (!isInitializeRequest(parsedBody)) {
+            // Clients must initialize before making any session-bound MCP requests.
             this.writeJsonResponse(
                 response,
                 400,
@@ -692,6 +711,7 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
+        // GET and DELETE requests are meaningful only after a session already exists.
         const sessionId = getSessionId(request);
         if (!sessionId) {
             this.writeJsonResponse(
@@ -737,6 +757,7 @@ export class PatchwalkMcpServer {
     }
 
     private async createSession(): Promise<PatchwalkMcpSession> {
+        // Session setup is slightly circular because the transport provides the id after initialize.
         const sessionRef: {
             current: PatchwalkMcpSession | undefined;
         } = {
@@ -776,6 +797,7 @@ export class PatchwalkMcpServer {
     }
 
     private createMcpServer(getSession: () => PatchwalkMcpSession | undefined): McpServer {
+        // Each MCP session gets its own SDK server instance, but all instances share daemon state.
         const server = new McpServer(PATCHWALK_MCP_SERVER_INFO, {
             capabilities: {
                 logging: {},
@@ -935,6 +957,7 @@ export class PatchwalkMcpServer {
                 );
                 const session = getSession();
 
+                // Logging messages give MCP-aware clients progress visibility during long playbacks.
                 await server.sendLoggingMessage(
                     {
                         level: 'info',
@@ -1003,6 +1026,7 @@ export class PatchwalkMcpServer {
     }
 
     private createServerInstructions(): string {
+        // Keep server instructions short and action-oriented because MCP clients may surface them verbatim.
         return [
             'Patchwalk replays narrated code handoffs inside live editor windows.',
             `Read ${PATCHWALK_STATUS_RESOURCE_URI} for daemon, worker, and dispatch status.`,
@@ -1065,6 +1089,7 @@ export class PatchwalkMcpServer {
     private async dispatchPlayback(
         payload: PatchwalkHandoffPayload,
     ): Promise<DispatchExecutionResult> {
+        // Prune before dispatch so a dead window cannot win an otherwise valid route.
         this.pruneStaleWorkers();
 
         if (this.workers.size === 0) {
@@ -1094,6 +1119,7 @@ export class PatchwalkMcpServer {
         this.activeDispatches.set(dispatch.dispatchId, dispatch);
 
         try {
+            // Broadcast only the minimal claim payload first; the full handoff waits for the winner.
             const claimEvent: PatchwalkWorkerEvent = {
                 type: 'playback.claim',
                 eventId: randomUUID(),
@@ -1159,6 +1185,7 @@ export class PatchwalkMcpServer {
             return;
         }
 
+        // Events queue in memory until the worker's next long-poll returns.
         worker.pendingEvents.push(event);
         if (!worker.pendingPoll) {
             return;
@@ -1177,6 +1204,7 @@ export class PatchwalkMcpServer {
         timeoutMs: number,
     ): Promise<PatchwalkWorkerEvent[]> {
         if (worker.pendingEvents.length > 0) {
+            // Flush immediately if work is already queued instead of waiting for the timeout.
             return worker.pendingEvents.splice(0, worker.pendingEvents.length);
         }
 
@@ -1198,6 +1226,7 @@ export class PatchwalkMcpServer {
                     worker.pendingPoll = undefined;
                 }
 
+                // Empty event batches are normal and tell the worker to long-poll again.
                 resolve([]);
             }, timeoutMs);
 
@@ -1225,6 +1254,7 @@ export class PatchwalkMcpServer {
     }
 
     private pruneStaleWorkers(): void {
+        // Liveness is heartbeat-based; stale workers are treated as gone without any graceful handshake.
         const now = Date.now();
         for (const worker of this.workers.values()) {
             const ageMs = now - new Date(worker.lastSeenAt).getTime();
@@ -1255,6 +1285,7 @@ export class PatchwalkMcpServer {
             lastSeenAt: registration.lastSeenAt,
             pendingEvents: [],
         };
+        // Registration sequence becomes the final deterministic tie-break when paths are otherwise equal.
         this.workers.set(registeredWorker.workerId, registeredWorker);
         return registeredWorker;
     }
@@ -1309,6 +1340,7 @@ export class PatchwalkMcpServer {
             return;
         }
 
+        // Mark disposed first so repeated close paths cannot double-close the same transport.
         session.disposed = true;
         if (session.id) {
             this.sessions.delete(session.id);
@@ -1322,6 +1354,7 @@ export class PatchwalkMcpServer {
         let totalSize = 0;
 
         for await (const chunk of request) {
+            // Convert every chunk to Uint8Array so Node's current Buffer.concat typing stays satisfied.
             const chunkBuffer =
                 typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
             totalSize += chunkBuffer.byteLength;
@@ -1343,6 +1376,7 @@ export class PatchwalkMcpServer {
     }
 
     private writeJsonResponse(response: ServerResponse, statusCode: number, body: unknown): void {
+        // Every non-streaming daemon route returns plain JSON for easy local debugging.
         response.writeHead(statusCode, { 'content-type': 'application/json' });
         response.end(JSON.stringify(body));
     }

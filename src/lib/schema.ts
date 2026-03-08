@@ -13,8 +13,10 @@ const nonEmptyStringSchema = z
     .min(1, 'must not be empty.')
     .regex(nonEmptyStringPattern, 'must contain at least one non-whitespace character.');
 
+// These payloads are consumed by humans during playback, so line numbers must stay positive.
 const positiveIntegerSchema = z.number().int().gte(1);
 
+// Target type is metadata for tools and navigation hints, not the primary playback mechanism.
 export const patchwalkTargetTypeSchema = z.enum(['symbol', 'range', 'line']);
 
 export const patchwalkRangeSchema = z
@@ -82,6 +84,7 @@ interface PatchwalkValidationFailure {
 export type PatchwalkValidationResult = PatchwalkValidationSuccess | PatchwalkValidationFailure;
 
 const formatIssuePath = (path: PropertyKey[]): string => {
+    // Format nested zod paths into field strings that are readable in VS Code error notifications.
     return path.reduce<string>((formattedPath, segment) => {
         if (typeof segment === 'number') {
             return `${formattedPath}[${segment}]`;
@@ -97,6 +100,7 @@ const formatIssuePath = (path: PropertyKey[]): string => {
 };
 
 const formatValidationIssue = (issue: z.ZodIssue): string => {
+    // Unrecognized keys deserve a clearer message than Zod's default wording.
     if (issue.code === 'unrecognized_keys') {
         const issuePath = formatIssuePath(issue.path);
         const location = issuePath ? ` at "${issuePath}"` : '';
@@ -113,6 +117,7 @@ const formatValidationIssue = (issue: z.ZodIssue): string => {
 };
 
 export const validatePatchwalkPayload = (value: unknown): PatchwalkValidationResult => {
+    // Validation always returns one human-readable error because the extension UI shows one message at a time.
     const result = patchwalkHandoffPayloadSchema.safeParse(value);
 
     if (result.success) {

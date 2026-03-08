@@ -1,6 +1,6 @@
 import { match, strictEqual } from 'node:assert';
 
-import { patchwalkHandoffPayloadSchema, validatePatchwalkPayload } from '../src/schema';
+import { patchwalkHandoffPayloadSchema, validatePatchwalkPayload } from '../src/lib/schema';
 
 // The public handoff schema is shared across MCP callers, the daemon, and workers.
 describe('patchwalk schema', () => {
@@ -21,7 +21,7 @@ describe('patchwalk schema', () => {
                     id: 'step-1',
                     title: 'Open file',
                     narration: 'Patchwalk is highlighting this range.',
-                    path: 'src/extension.ts',
+                    path: 'src/extension/index.ts',
                     type: 'symbol',
                     symbol: 'activate',
                     range: {
@@ -58,7 +58,7 @@ describe('patchwalk schema', () => {
                     id: 'step-1',
                     title: 'Broken range',
                     narration: 'This should fail validation.',
-                    path: 'src/extension.ts',
+                    path: 'src/extension/index.ts',
                     range: {
                         startLine: 10,
                         endLine: 5,
@@ -89,7 +89,7 @@ describe('patchwalk schema', () => {
                     id: 'step-1',
                     title: 'Open file',
                     narration: 'Patchwalk is highlighting this range.',
-                    path: 'src/extension.ts',
+                    path: 'src/extension/index.ts',
                     range: {
                         startLine: 1,
                         endLine: 20,
@@ -138,7 +138,7 @@ describe('patchwalk schema', () => {
                     id: 'step-1',
                     title: 'Open file',
                     narration: 'Patchwalk is highlighting this range.',
-                    path: 'src/extension.ts',
+                    path: 'src/extension/index.ts',
                     range: {
                         startLine: 1,
                         endLine: 20,

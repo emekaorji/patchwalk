@@ -20,6 +20,7 @@ export const matchBasePathToWorkspaceRoots = (
     basePath: string,
     workspaceRoots: string[],
 ): PatchwalkWorkerMatch | undefined => {
+    // Workers compute their own best match locally before the daemon compares claims globally.
     let bestMatch: PatchwalkWorkerMatch | undefined;
 
     for (const workspaceRoot of workspaceRoots) {

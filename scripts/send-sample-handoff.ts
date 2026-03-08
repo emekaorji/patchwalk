@@ -9,8 +9,8 @@ import {
     PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
     PATCHWALK_PLAY_TOOL_NAME,
     PATCHWALK_STATUS_RESOURCE_URI,
-} from '../src/mcpCatalog';
-import type { PatchwalkHandoffPayload } from '../src/schema';
+} from '../src/lib/mcpCatalog';
+import type { PatchwalkHandoffPayload } from '../src/lib/schema';
 
 /**
  * Manual smoke test for the full daemon flow: inspect the MCP surface, then send a long narrated

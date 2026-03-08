@@ -11,6 +11,7 @@ import { patchwalkHandoffPayloadSchema } from './schema';
 const nonEmptyStringSchema = z.string().min(1).regex(/\S/, 'must not be blank.');
 const positiveIntegerSchema = z.number().int().gte(1);
 
+// These names and URIs are stable public contract, so keep them centralized and literal.
 export const PATCHWALK_MCP_SERVER_INFO = {
     name: 'patchwalk-mcp',
     version: '1.0.0',
@@ -83,6 +84,7 @@ export interface PatchwalkStatusResource {
 export const normalizePatchwalkPlayPayload = (
     argumentsValue: PatchwalkPlayArguments,
 ): PatchwalkHandoffPayload => {
+    // Support both the direct payload shape and the older wrapper during client migration.
     return 'payload' in argumentsValue ? argumentsValue.payload : argumentsValue;
 };
 
@@ -105,7 +107,7 @@ export const createPatchwalkExampleHandoff = (): PatchwalkHandoffPayload => {
                 title: 'Extension worker activation',
                 narration:
                     'Patchwalk activates, creates its playback runner, ensures the daemon is up, and registers the current window as a worker.',
-                path: 'src/extension.ts',
+                path: 'src/extension/index.ts',
                 type: 'symbol',
                 symbol: 'activate',
                 range: {
@@ -118,7 +120,7 @@ export const createPatchwalkExampleHandoff = (): PatchwalkHandoffPayload => {
                 title: 'Daemon MCP entrypoint',
                 narration:
                     'The daemon exposes MCP tools, prompts, resources, and worker-control endpoints over local HTTP.',
-                path: 'src/mcpServer.ts',
+                path: 'src/daemon/mcpServer.ts',
                 type: 'symbol',
                 symbol: 'PatchwalkMcpServer',
                 range: {

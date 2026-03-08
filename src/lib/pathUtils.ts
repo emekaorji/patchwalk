@@ -6,6 +6,7 @@ import path from 'node:path';
  * become nondeterministic across windows.
  */
 const trimTrailingSeparators = (value: string): string => {
+    // Preserve filesystem roots exactly as-is so `/` and drive roots do not collapse to empty strings.
     if (value === path.parse(value).root) {
         return value;
     }
@@ -14,6 +15,7 @@ const trimTrailingSeparators = (value: string): string => {
 };
 
 export const normalizeAbsolutePath = async (value: string): Promise<string> => {
+    // Every shared path enters the routing layer through this guard.
     if (!path.isAbsolute(value)) {
         throw new Error(`Expected an absolute filesystem path, received "${value}".`);
     }
@@ -30,10 +32,12 @@ export const normalizeAbsolutePath = async (value: string): Promise<string> => {
 };
 
 export const isEqualOrParentPath = (candidateParentPath: string, targetPath: string): boolean => {
+    // Routing treats an exact match as a valid parent match because the exact-project window should win.
     if (candidateParentPath === targetPath) {
         return true;
     }
 
+    // Node's relative result gives us a platform-safe parent check without manual separator logic.
     const relativePath = path.relative(candidateParentPath, targetPath);
     return (
         relativePath.length > 0 && !relativePath.startsWith('..') && !path.isAbsolute(relativePath)

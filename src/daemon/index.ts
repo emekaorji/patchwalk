@@ -8,6 +8,7 @@ import { PatchwalkMcpServer } from './mcpServer';
  * the window process.
  */
 const readDaemonPort = (): number => {
+    // The daemon is debuggable outside VS Code, so local CLI overrides need to win first.
     // CLI flags win so manual debugging can override persisted settings easily.
     const cliPortIndex = process.argv.indexOf('--port');
     if (cliPortIndex >= 0) {
@@ -26,11 +27,13 @@ const readDaemonPort = (): number => {
 };
 
 const main = async (): Promise<void> => {
+    // Create the singleton daemon for this process and then keep Node alive on the HTTP listener.
     const server = new PatchwalkMcpServer({
         port: readDaemonPort(),
     });
 
     const stopServer = async () => {
+        // Shutdown logic is shared by both signal handlers so the close path stays consistent.
         await server.stop();
     };
 

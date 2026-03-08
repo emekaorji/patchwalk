@@ -5,9 +5,10 @@ import process from 'node:process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
-import { PATCHWALK_WORKER_API_VERSION } from '../src/controlProtocol';
-import { PatchwalkDaemonClient } from '../src/daemonClient';
-import type { PatchwalkStatusResource } from '../src/mcpCatalog';
+import { PatchwalkMcpServer } from '../src/daemon/mcpServer';
+import { PatchwalkDaemonClient } from '../src/extension/daemonClient';
+import { PATCHWALK_WORKER_API_VERSION } from '../src/lib/controlProtocol';
+import type { PatchwalkStatusResource } from '../src/lib/mcpCatalog';
 import {
     PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
     PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
@@ -16,10 +17,9 @@ import {
     PATCHWALK_OPERATOR_MANUAL_RESOURCE_URI,
     PATCHWALK_PLAY_TOOL_NAME,
     PATCHWALK_STATUS_RESOURCE_URI,
-} from '../src/mcpCatalog';
-import { PatchwalkMcpServer } from '../src/mcpServer';
-import { matchBasePathToWorkspaceRoots } from '../src/routing';
-import type { PatchwalkHandoffPayload } from '../src/schema';
+} from '../src/lib/mcpCatalog';
+import { matchBasePathToWorkspaceRoots } from '../src/lib/routing';
+import type { PatchwalkHandoffPayload } from '../src/lib/schema';
 
 // Health checks come from the daemon side-channel endpoint rather than MCP resources.
 interface PatchwalkHealthResponse {
@@ -148,7 +148,7 @@ const createPayload = (basePath: string): PatchwalkHandoffPayload => {
                 id: 'step-1',
                 title: 'Open extension entry',
                 narration: 'Patchwalk should open the extension entry file for this test.',
-                path: 'src/extension.ts',
+                path: 'src/extension/index.ts',
                 range: {
                     startLine: 1,
                     endLine: 20,

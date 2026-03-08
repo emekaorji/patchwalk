@@ -30,7 +30,7 @@
     "categories": [
         "Other"
     ],
-    "main": "./out/src/extension.js",
+    "main": "./out/src/extension/index.js",
     "icon": "assets/logo.png",
     "packageManager": "pnpm@9.9.0",
     "engines": {
