@@ -4,6 +4,7 @@ import process from 'node:process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
+import * as logger from '../src/lib/logger';
 import {
     PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
     PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
@@ -584,6 +585,8 @@ const samplePayload: PatchwalkHandoffPayload = {
     summary: `Patchwalk is about to run a ${walkthrough.length}-step walkthrough of the demo workspace, from package metadata through auth, data access, services, routing, and server startup.`,
     walkthrough,
 };
+
+logger.info('PAYLOAD', samplePayload);
 
 const fetchJson = async <T>(input: string, init?: RequestInit): Promise<T> => {
     const response = await fetch(input, init);

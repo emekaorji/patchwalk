@@ -1,10 +1,10 @@
 import type { WriteStream } from 'node:fs';
-import { createWriteStream } from 'node:fs';
-import fs from 'node:fs/promises';
+import { createWriteStream, mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 type PatchwalkLogLevel = 'INFO' | 'WARN' | 'ERROR';
+const LOG_FILE_PATH = path.join(os.homedir(), '.patchwalk', 'log.txt');
 
 const formatLogDetails = (details?: unknown): string => {
     if (details === undefined) {
@@ -29,20 +29,19 @@ const formatLogDetails = (details?: unknown): string => {
 /**
  * File-backed daemon logger used for detached runs where stdout/stderr are not attached.
  */
-
-let stream: WriteStream;
-
-async function init() {
-    const configuredPath = path.join(os.homedir(), '.patchwalk', 'log.txt');
-    await fs.mkdir(path.dirname(configuredPath), { recursive: true });
-
-    stream = createWriteStream(configuredPath, {
+const initializeStream = (): WriteStream => {
+    // Logger initialization must be synchronous because the daemon writes during bootstrap.
+    mkdirSync(path.dirname(LOG_FILE_PATH), { recursive: true });
+    const createdStream = createWriteStream(LOG_FILE_PATH, {
         flags: 'a',
     });
-    stream.on('error', (error) => {
+    createdStream.on('error', (error) => {
         console.error('Patchwalk daemon logger stream error:', error);
     });
-}
+    return createdStream;
+};
+
+const stream = initializeStream();
 
 function write(level: PatchwalkLogLevel, message: string, details?: unknown): void {
     if (stream.destroyed) {
@@ -74,6 +73,4 @@ async function close(): Promise<void> {
     });
 }
 
-init();
-
-export { close, error, info, warn };
+export { close, error, info, LOG_FILE_PATH, warn };

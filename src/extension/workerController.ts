@@ -40,6 +40,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
     private readonly daemonClient: PatchwalkDaemonClient;
     private readonly disposables: vscode.Disposable[] = [];
     private heartbeatTimer: NodeJS.Timeout | undefined;
+    private connectionPromise: Promise<void> | undefined;
     private pollLoop: Promise<void> | undefined;
     private stopping = false;
     /**
@@ -166,6 +167,18 @@ export class PatchwalkWorkerController implements vscode.Disposable {
             return;
         }
 
+        if (this.connectionPromise) {
+            await this.connectionPromise;
+            return;
+        }
+
+        this.connectionPromise = this.ensureConnectedInternal().finally(() => {
+            this.connectionPromise = undefined;
+        });
+        await this.connectionPromise;
+    }
+
+    private async ensureConnectedInternal(): Promise<void> {
         // Health-check and auto-spawn are centralized inside the daemon client.
         await this.daemonClient.ensureServerRunning();
 

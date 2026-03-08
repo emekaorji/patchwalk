@@ -416,6 +416,8 @@ export class PatchwalkMcpServer {
             // Health is intentionally tiny and does not require MCP negotiation.
             this.writeJsonResponse(response, 200, {
                 ok: true,
+                serverKind: 'patchwalk-daemon',
+                apiVersion: '1.0.0',
                 endpointUrl: this.endpointUrl ?? null,
                 daemonPid: process.pid,
                 activeSessionCount: this.activeSessionCount,
