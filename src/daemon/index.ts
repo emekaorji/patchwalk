@@ -1,6 +1,6 @@
 import process from 'node:process';
 
-import * as logger from './logger';
+import * as logger from '../lib/logger';
 import { PatchwalkMcpServer } from './mcpServer';
 
 /**

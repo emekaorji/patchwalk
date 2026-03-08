@@ -24,6 +24,7 @@ import {
     patchwalkWorkerRegistrationSchema,
     patchwalkWorkerResultSchema,
 } from '../lib/controlProtocol';
+import * as logger from '../lib/logger';
 import type {
     PatchwalkDispatchStatusResource,
     PatchwalkStatusResource,
@@ -51,7 +52,6 @@ import { normalizeAbsolutePath } from '../lib/pathUtils';
 import type { PatchwalkWorkerClaimSummary } from '../lib/routing';
 import { compareWorkerClaims } from '../lib/routing';
 import type { PatchwalkHandoffPayload } from '../lib/schema';
-import * as logger from './logger';
 
 /**
  * The daemon owns two related protocols:
