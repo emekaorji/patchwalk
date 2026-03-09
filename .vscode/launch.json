@@ -6,13 +6,42 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Dev",
+            "name": "Dev Primary",
             "type": "extensionHost",
             "request": "launch",
             "args": [
+                "--new-window",
                 "--disable-extensions",
+                "--user-data-dir=${workspaceFolder}/.vscode-dev-userdata/primary",
+                "--extensions-dir=${workspaceFolder}/.vscode-dev-exts/primary",
                 "--extensionDevelopmentPath=${workspaceFolder}",
-                "${workspaceFolder}/test-workspace"
+                "${workspaceFolder}/test-workspace-primary"
+            ],
+            "outFiles": ["${workspaceFolder}/out/**/*.js"],
+            "skipFiles": [
+                "<node_internals>/**",
+                "**/node_modules/**",
+                "**/resources/app/out/vs/**",
+                "**/.vscode-insiders/extensions/",
+                "**/.vscode/extensions/"
+            ],
+            "sourceMaps": true,
+            "env": {
+                "VSCODE_DEBUG_MODE": "true"
+            },
+            "preLaunchTask": "${defaultBuildTask}"
+        },
+        {
+            "name": "Dev Secondary",
+            "type": "extensionHost",
+            "request": "launch",
+            "args": [
+                "--new-window",
+                "--disable-extensions",
+                "--user-data-dir=${workspaceFolder}/.vscode-dev-userdata/secondary",
+                "--extensions-dir=${workspaceFolder}/.vscode-dev-exts/secondary",
+                "--extensionDevelopmentPath=${workspaceFolder}",
+                "${workspaceFolder}/test-workspace-secondary"
             ],
             "outFiles": ["${workspaceFolder}/out/**/*.js"],
             "skipFiles": [
@@ -49,6 +78,13 @@
                 "VSCODE_DEBUG_MODE": "true"
             },
             "preLaunchTask": "compile:test"
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Dev Both",
+            "configurations": ["Dev Primary", "Dev Secondary"],
+            "stopAll": true
         }
     ]
 }

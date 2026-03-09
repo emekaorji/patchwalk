@@ -81,13 +81,16 @@
     "eslintConfig": {
         "extends": "@yutengjing/eslint-config-typescript",
         "ignorePatterns": [
-            "test-workspace"
+            "test-workspace*"
         ]
     },
     "prettier": "@yutengjing/prettier-config",
     "lint-staged": {
-        "*.{ts,json,md}": [
+        "{src,test,scripts}/**/*.ts": [
             "eslint --fix",
+            "prettier --write"
+        ],
+        "**/*.{json,md}": [
             "prettier --write"
         ]
     },
