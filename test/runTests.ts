@@ -10,7 +10,7 @@ import { runTests } from '@vscode/test-electron';
     const projectPath = resolve(__dirname, '../../');
     const extensionDevelopmentPath = projectPath;
     const extensionTestsPath = resolve(projectPath, './out/test');
-    const testWorkspace = resolve(projectPath, './test-workspace');
+    const testWorkspace = resolve(projectPath, './test-workspace-primary');
 
     await runTests({
         version: 'insiders',

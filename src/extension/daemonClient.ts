@@ -5,21 +5,13 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { z } from 'zod';
 
-import type {
-    PatchwalkWorkerClaim,
-    PatchwalkWorkerEvent,
-    PatchwalkWorkerHeartbeat,
-    PatchwalkWorkerRegistration,
-    PatchwalkWorkerRegistrationResponse,
-    PatchwalkWorkerResult,
-} from '../lib/controlProtocol';
-import {
-    patchwalkWorkerClaimSchema,
-    patchwalkWorkerEventsResponseSchema,
-    patchwalkWorkerRegistrationResponseSchema,
-} from '../lib/controlProtocol';
+import { PATCHWALK_WORKER_SOCKET_PATH } from '../lib/controlProtocol';
 import type { PatchwalkStatusResource } from '../lib/mcpCatalog';
-import { PATCHWALK_PLAY_TOOL_NAME, PATCHWALK_STATUS_RESOURCE_URI } from '../lib/mcpCatalog';
+import {
+    PATCHWALK_PLAY_TOOL_NAME,
+    PATCHWALK_STATUS_RESOURCE_URI,
+    PATCHWALK_STOP_TOOL_NAME,
+} from '../lib/mcpCatalog';
 import type { PatchwalkHandoffPayload } from '../lib/schema';
 
 /**
@@ -40,6 +32,8 @@ const patchwalkDaemonHealthSchema = z.strictObject({
     activeDispatchCount: z.number().int().gte(0),
     serverKind: z.literal('patchwalk-daemon'),
     apiVersion: z.literal('1.0.0'),
+    workerTransport: z.literal('websocket'),
+    workerSocketPath: z.literal(PATCHWALK_WORKER_SOCKET_PATH),
 });
 
 type PatchwalkHealthResponse = z.infer<typeof patchwalkDaemonHealthSchema>;
@@ -95,6 +89,10 @@ export class PatchwalkDaemonClient {
         return `${this.baseUrl}/mcp`;
     }
 
+    public get workerSocketUrl(): string {
+        return `${this.baseUrl.replace(/^http/, 'ws')}/workers/connect`;
+    }
+
     public async ensureServerRunning(): Promise<void> {
         if (this.startupPromise) {
             await this.startupPromise;
@@ -134,26 +132,14 @@ export class PatchwalkDaemonClient {
 
     public async readStatusResource(): Promise<PatchwalkStatusResource> {
         await this.ensureServerRunning();
-        const client = new Client({
-            name: 'patchwalk-extension-client',
-            version: '1.0.0',
-        });
-        const transport = new StreamableHTTPClientTransport(new URL(this.endpointUrl));
-
         try {
-            await client.connect(transport);
-            // Use the daemon's own status resource so one source of truth drives UI and tests.
-            const result = await client.readResource({
-                uri: PATCHWALK_STATUS_RESOURCE_URI,
+            // Prefer the lightweight daemon endpoint to avoid opening MCP sessions for status checks.
+            return await this.requestJson<PatchwalkStatusResource>('/status', {
+                method: 'GET',
             });
-            const firstContent = result.contents[0];
-            if (!firstContent || !('text' in firstContent)) {
-                throw new Error('Patchwalk status resource did not return text content.');
-            }
-
-            return JSON.parse(firstContent.text) as PatchwalkStatusResource;
-        } finally {
-            await Promise.allSettled([transport.terminateSession(), transport.close()]);
+        } catch {
+            // Fallback keeps status compatible with older daemon builds that only expose MCP resources.
+            return this.readStatusResourceViaMcp();
         }
     }
 
@@ -185,9 +171,39 @@ export class PatchwalkDaemonClient {
         }
     }
 
+    public async stopPlayback(): Promise<void> {
+        await this.ensureServerRunning();
+        const client = new Client({
+            name: 'patchwalk-extension-client',
+            version: '1.0.0',
+        });
+        const transport = new StreamableHTTPClientTransport(new URL(this.endpointUrl));
+
+        try {
+            await client.connect(transport);
+            const result = await client.callTool({
+                name: PATCHWALK_STOP_TOOL_NAME,
+                arguments: {},
+            });
+            if (result.isError) {
+                const textContent = (result.content as Array<{ type: string; text?: string }>).find(
+                    (contentBlock) => contentBlock.type === 'text',
+                );
+                throw new Error(textContent?.text ?? 'Patchwalk daemon could not stop playback.');
+            }
+        } finally {
+            await Promise.allSettled([transport.terminateSession(), transport.close()]);
+        }
+    }
+
     private async ensureServerRunningInternal(): Promise<void> {
         const health = await this.fetchCompatibleHealth();
         if (health) {
+            return;
+        }
+
+        // Another window may have just spawned the daemon; give it a short grace period before kill.
+        if (await this.waitForHealthyOrTimeout(Date.now() + 900)) {
             return;
         }
 
@@ -210,6 +226,29 @@ export class PatchwalkDaemonClient {
         childProcess.unref();
 
         await this.waitForHealthy(Date.now() + 5_000);
+    }
+
+    private async readStatusResourceViaMcp(): Promise<PatchwalkStatusResource> {
+        const client = new Client({
+            name: 'patchwalk-extension-client',
+            version: '1.0.0',
+        });
+        const transport = new StreamableHTTPClientTransport(new URL(this.endpointUrl));
+
+        try {
+            await client.connect(transport);
+            const result = await client.readResource({
+                uri: PATCHWALK_STATUS_RESOURCE_URI,
+            });
+            const firstContent = result.contents[0];
+            if (!firstContent || !('text' in firstContent)) {
+                throw new Error('Patchwalk status resource did not return text content.');
+            }
+
+            return JSON.parse(firstContent.text) as PatchwalkStatusResource;
+        } finally {
+            await Promise.allSettled([transport.terminateSession(), transport.close()]);
+        }
     }
 
     private async fetchCompatibleHealth(): Promise<PatchwalkHealthResponse | undefined> {
@@ -288,69 +327,28 @@ export class PatchwalkDaemonClient {
     }
 
     private async waitForHealthy(deadlineAt: number): Promise<void> {
-        if (Date.now() > deadlineAt) {
-            throw new Error('Patchwalk daemon did not become healthy after startup.');
-        }
-
-        if (await this.isHealthy()) {
+        if (await this.waitForHealthyOrTimeout(deadlineAt)) {
             return;
         }
 
-        // Keep retry intervals short so activation feels immediate after a cold start.
+        throw new Error('Patchwalk daemon did not become healthy after startup.');
+    }
+
+    private async waitForHealthyOrTimeout(deadlineAt: number, delayMs = 120): Promise<boolean> {
+        if (Date.now() > deadlineAt) {
+            return false;
+        }
+
+        if (await this.isHealthy()) {
+            return true;
+        }
+
         await new Promise((resolve) => {
-            setTimeout(resolve, 150);
+            setTimeout(resolve, delayMs);
         });
 
-        await this.waitForHealthy(deadlineAt);
-    }
-
-    public async registerWorker(
-        registration: PatchwalkWorkerRegistration,
-    ): Promise<PatchwalkWorkerRegistrationResponse> {
-        await this.ensureServerRunning();
-        // Registration establishes worker ownership metadata and refreshes it after reconnects.
-        const response = await this.requestJson('/workers', {
-            method: 'POST',
-            body: JSON.stringify(registration),
-        });
-        return patchwalkWorkerRegistrationResponseSchema.parse(response);
-    }
-
-    public async sendHeartbeat(
-        workerId: string,
-        heartbeat: PatchwalkWorkerHeartbeat,
-    ): Promise<void> {
-        await this.ensureServerRunning();
-        await this.requestJson(`/workers/${workerId}/heartbeat`, {
-            method: 'POST',
-            body: JSON.stringify(heartbeat),
-        });
-    }
-
-    public async pollEvents(workerId: string, waitMs: number): Promise<PatchwalkWorkerEvent[]> {
-        await this.ensureServerRunning();
-        // Long-polling keeps the control protocol simple without requiring a separate socket transport.
-        const response = await this.requestJson(`/workers/${workerId}/events?waitMs=${waitMs}`, {
-            method: 'GET',
-        });
-        return patchwalkWorkerEventsResponseSchema.parse(response).events;
-    }
-
-    public async submitClaim(workerId: string, claim: PatchwalkWorkerClaim): Promise<void> {
-        await this.ensureServerRunning();
-        const parsedClaim = patchwalkWorkerClaimSchema.parse(claim);
-        await this.requestJson(`/workers/${workerId}/claims`, {
-            method: 'POST',
-            body: JSON.stringify(parsedClaim),
-        });
-    }
-
-    public async submitResult(workerId: string, result: PatchwalkWorkerResult): Promise<void> {
-        await this.ensureServerRunning();
-        await this.requestJson(`/workers/${workerId}/results`, {
-            method: 'POST',
-            body: JSON.stringify(result),
-        });
+        // Back off quickly to reduce probe storms while still keeping startup responsive.
+        return this.waitForHealthyOrTimeout(deadlineAt, Math.min(delayMs + 80, 500));
     }
 
     private async requestJson<T = unknown>(

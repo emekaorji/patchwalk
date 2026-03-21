@@ -19,6 +19,7 @@ export const PATCHWALK_MCP_SERVER_INFO = {
 } as const;
 
 export const PATCHWALK_PLAY_TOOL_NAME = 'patchwalk.play';
+export const PATCHWALK_STOP_TOOL_NAME = 'patchwalk.stop';
 export const PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME = 'patchwalk.compose-handoff';
 export const PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME = 'patchwalk.expand-walkthrough';
 
@@ -43,8 +44,15 @@ export const patchwalkPlayResultSchema = z.strictObject({
     matchedRoot: nonEmptyStringSchema,
 });
 
+export const patchwalkStopResultSchema = z.strictObject({
+    status: z.enum(['stopped', 'idle']),
+    handoffId: nonEmptyStringSchema.optional(),
+    workerId: nonEmptyStringSchema.optional(),
+});
+
 export type PatchwalkPlayArguments = z.infer<typeof patchwalkPlayArgumentsSchema>;
 export type PatchwalkPlayResult = z.infer<typeof patchwalkPlayResultSchema>;
+export type PatchwalkStopResult = z.infer<typeof patchwalkStopResultSchema>;
 
 // Status payloads are intentionally daemon-centric so humans and MCP clients see the same runtime picture.
 export interface PatchwalkWorkerStatusResource {
@@ -54,15 +62,27 @@ export interface PatchwalkWorkerStatusResource {
     workspaceRoots: string[];
     registeredAt: string;
     lastSeenAt: string;
+    connectionState: 'connected';
+    playbackState: 'idle' | 'playing' | 'stopping';
+    activeHandoffId: string | null;
 }
 
 export interface PatchwalkDispatchStatusResource {
     dispatchId: string;
     handoffId: string;
     basePath: string;
-    state: 'claiming' | 'executing';
+    state: 'preparing' | 'executing' | 'stopping';
     createdAt: string;
     selectedWorkerId?: string;
+}
+
+export interface PatchwalkActiveHandoffStatusResource {
+    dispatchId: string | null;
+    handoffId: string | null;
+    basePath: string | null;
+    workerId: string | null;
+    state: 'preparing' | 'executing' | 'stopping' | 'playing';
+    source: 'daemon-dispatch' | 'worker-state';
 }
 
 export interface PatchwalkStatusResource {
@@ -76,6 +96,7 @@ export interface PatchwalkStatusResource {
     workers: PatchwalkWorkerStatusResource[];
     activeDispatchCount: number;
     activeDispatches: PatchwalkDispatchStatusResource[];
+    activeHandoff: PatchwalkActiveHandoffStatusResource | null;
     prompts: string[];
     resources: string[];
     tools: string[];
@@ -141,6 +162,7 @@ export const createPatchwalkOperatorManual = (endpointUrl: string): string => {
         '',
         'Capabilities:',
         `- Tool: \`${PATCHWALK_PLAY_TOOL_NAME}\` plays a narrated handoff inside VS Code.`,
+        `- Tool: \`${PATCHWALK_STOP_TOOL_NAME}\` stops the one active narrated handoff on the machine.`,
         `- Resource: \`${PATCHWALK_STATUS_RESOURCE_URI}\` reports server status and active sessions.`,
         `- Resource: \`${PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI}\` returns a valid example handoff payload.`,
         `- Resource: \`${PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI}\` explains how to write a strong developer-grade handoff.`,
@@ -151,7 +173,9 @@ export const createPatchwalkOperatorManual = (endpointUrl: string): string => {
         '- Pass the handoff JSON object directly as tool arguments.',
         '- Backward compatibility: a wrapper of the form `{ "payload": <handoff> }` is also accepted.',
         '- `basePath` is required and must be an absolute project path on the local machine.',
-        '- The daemon broadcasts a claim request to all live Patchwalk windows and selects one winner using exact match, then longest parent-path match, then earliest registration.',
+        '- Patchwalk allows exactly one active handoff across the whole machine at a time.',
+        '- The daemon routes directly to one live Patchwalk window using exact match, then longest parent-path match, then earliest registration.',
+        '- `patchwalk.stop` stops the currently active handoff globally. If nothing is running, it reports an idle result.',
         '- Playback will move the selected editor window, highlight ranges, and trigger local narration.',
         '',
         'Authoring expectations:',
@@ -161,6 +185,7 @@ export const createPatchwalkOperatorManual = (endpointUrl: string): string => {
         '',
         'Operational notes:',
         '- Use an MCP client library for session handling and lifecycle notifications.',
+        '- Patchwalk windows keep one persistent worker connection to the daemon and re-register after reconnect.',
         '- Patchwalk windows self-heal the daemon. If the daemon dies, any live window will restart and re-register it.',
         '- The health check remains available at `GET /health` for local diagnostics.',
     ].join('\n');

@@ -163,7 +163,7 @@ const main = async (): Promise<void> => {
             name: PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
             arguments: {
                 changeSummary: 'Walk through the sample workspace in detail.',
-                changedFiles: 'test-workspace/src/**/*',
+                changedFiles: 'test-workspace-primary/src/**/*',
                 focusAreas: 'Explain the architecture from entrypoint through routes and services.',
             },
         });

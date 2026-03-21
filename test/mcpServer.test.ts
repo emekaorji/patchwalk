@@ -4,9 +4,15 @@ import process from 'node:process';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import WebSocket from 'ws';
 
 import { PatchwalkMcpServer } from '../src/daemon/mcpServer';
 import { PatchwalkDaemonClient } from '../src/extension/daemonClient';
+import type {
+    PatchwalkDaemonToWorkerMessage,
+    PatchwalkPlaybackExecuteMessage,
+    PatchwalkPlaybackStopMessage,
+} from '../src/lib/controlProtocol';
 import { PATCHWALK_WORKER_API_VERSION } from '../src/lib/controlProtocol';
 import type { PatchwalkStatusResource } from '../src/lib/mcpCatalog';
 import {
@@ -17,11 +23,11 @@ import {
     PATCHWALK_OPERATOR_MANUAL_RESOURCE_URI,
     PATCHWALK_PLAY_TOOL_NAME,
     PATCHWALK_STATUS_RESOURCE_URI,
+    PATCHWALK_STOP_TOOL_NAME,
 } from '../src/lib/mcpCatalog';
 import { matchBasePathToWorkspaceRoots } from '../src/lib/routing';
 import type { PatchwalkHandoffPayload } from '../src/lib/schema';
 
-// Health checks come from the daemon side-channel endpoint rather than MCP resources.
 interface PatchwalkHealthResponse {
     ok: boolean;
     endpointUrl: string | null;
@@ -31,107 +37,196 @@ interface PatchwalkHealthResponse {
     activeDispatchCount: number;
 }
 
-/**
- * The fake worker speaks the same private daemon protocol as the real extension window, but strips
- * out editor integration so the daemon can be tested deterministically in-process.
- */
+interface FakePatchwalkWorkerOptions {
+    holdExecutionUntilStopped?: boolean;
+    disconnectOnStop?: boolean;
+}
+
 class FakePatchwalkWorker {
     public readonly workerId = randomUUID();
     public readonly executedPayloads: PatchwalkHandoffPayload[] = [];
+    public readonly startedExecution = this.createDeferred<void>();
+    public readonly stoppedExecution = this.createDeferred<void>();
+    private socket: WebSocket | undefined;
     private stopped = false;
-    private pollPromise: Promise<void> | undefined;
 
     public constructor(
         private readonly daemonClient: PatchwalkDaemonClient,
         private readonly workspaceRoots: string[],
         private readonly extensionVersion = 'test-extension',
+        private readonly options: FakePatchwalkWorkerOptions = {},
     ) {}
 
     public async start(options: { lastSeenAt?: string } = {}): Promise<void> {
-        await this.daemonClient.registerWorker({
+        this.socket = new WebSocket(this.daemonClient.workerSocketUrl);
+        await new Promise<void>((resolve, reject) => {
+            this.socket!.once('open', resolve);
+            this.socket!.once('error', reject);
+        });
+
+        this.socket.on('message', (rawData) => {
+            this.handleMessage(rawData).catch((error: unknown) => {
+                throw error;
+            });
+        });
+
+        this.sendMessage({
+            type: 'worker.register',
+            messageId: randomUUID(),
             workerId: this.workerId,
+            sentAt: new Date().toISOString(),
             processId: process.pid,
             extensionVersion: this.extensionVersion,
             workspaceRoots: this.workspaceRoots,
             lastSeenAt: options.lastSeenAt ?? new Date().toISOString(),
             apiVersion: PATCHWALK_WORKER_API_VERSION,
+            playbackState: 'idle',
         });
 
-        this.pollPromise = this.poll();
+        await new Promise((resolve) => {
+            setTimeout(resolve, 25);
+        });
     }
 
     public async stop(): Promise<void> {
         this.stopped = true;
-        await Promise.race([
-            this.pollPromise ?? Promise.resolve(),
-            new Promise((resolve) => {
-                setTimeout(resolve, 700);
-            }),
-        ]);
-    }
-
-    private async poll(): Promise<void> {
-        if (this.stopped) {
+        if (!this.socket) {
             return;
         }
 
-        try {
-            const events = await this.daemonClient.pollEvents(this.workerId, 500);
-            // Preserve event order so claim/execute semantics match the real worker loop.
-            await events.reduce<Promise<void>>(async (queue, event) => {
-                await queue;
+        await new Promise<void>((resolve) => {
+            this.socket!.once('close', () => {
+                resolve();
+            });
+            this.socket!.close();
+        });
+        this.socket = undefined;
+    }
 
-                switch (event.type) {
-                    case 'playback.claim': {
-                        const matchForWorker = matchBasePathToWorkspaceRoots(
-                            event.basePath,
-                            this.workspaceRoots,
-                        );
-                        if (!matchForWorker) {
-                            await this.daemonClient.submitClaim(this.workerId, {
-                                dispatchId: event.dispatchId,
-                                accepted: false,
-                            });
-                            return;
-                        }
+    private async handleMessage(rawData: WebSocket.RawData): Promise<void> {
+        const message = JSON.parse(String(rawData)) as PatchwalkDaemonToWorkerMessage;
+        switch (message.type) {
+            case 'playback.prepare':
+                await this.handlePrepareMessage(message);
+                return;
+            case 'playback.execute':
+                await this.handleExecuteMessage(message);
+                return;
+            case 'playback.stop':
+                await this.handleStopMessage(message);
+                return;
+            case 'worker.reconcile':
+                this.sendHeartbeat('idle');
+                return;
+        }
+    }
 
-                        await this.daemonClient.submitClaim(this.workerId, {
-                            dispatchId: event.dispatchId,
-                            accepted: true,
-                            matchedRoot: matchForWorker.matchedRoot,
-                            matchKind: matchForWorker.matchKind,
-                        });
-                        return;
-                    }
-                    case 'playback.execute':
-                        this.executedPayloads.push(event.payload);
-                        await this.daemonClient.submitResult(this.workerId, {
-                            dispatchId: event.dispatchId,
-                            handoffId: event.payload.handoffId,
-                            status: 'completed',
-                            stepsPlayed: event.payload.walkthrough.length,
-                        });
-                        return;
-                    case 'playback.cancel':
-                    case 'worker.reconcile':
-                        return;
-                }
-            }, Promise.resolve());
-        } catch (error) {
-            if (!this.stopped) {
-                throw error;
-            }
+    private async handlePrepareMessage(message: {
+        dispatchId: string;
+        handoffId: string;
+        basePath: string;
+    }): Promise<void> {
+        const matchForWorker = matchBasePathToWorkspaceRoots(message.basePath, this.workspaceRoots);
+        if (matchForWorker) {
+            return;
         }
 
-        if (!this.stopped) {
-            await this.poll();
+        this.sendMessage({
+            type: 'playback.failed',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            dispatchId: message.dispatchId,
+            handoffId: message.handoffId,
+            phase: 'prepare',
+            reasonCode: 'unavailable',
+            error: 'Worker does not own the requested base path anymore.',
+        });
+    }
+
+    private async handleExecuteMessage(message: PatchwalkPlaybackExecuteMessage): Promise<void> {
+        this.executedPayloads.push(message.payload);
+        this.sendHeartbeat('playing', message.payload.handoffId);
+        this.startedExecution.resolve();
+
+        if (this.options.holdExecutionUntilStopped) {
+            return;
         }
+
+        this.sendMessage({
+            type: 'playback.completed',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            dispatchId: message.dispatchId,
+            handoffId: message.payload.handoffId,
+            stepsPlayed: message.payload.walkthrough.length,
+        });
+        this.sendHeartbeat('idle');
+    }
+
+    private async handleStopMessage(message: PatchwalkPlaybackStopMessage): Promise<void> {
+        if (this.options.disconnectOnStop) {
+            await this.stop();
+            this.stoppedExecution.resolve();
+            return;
+        }
+
+        this.sendHeartbeat('stopping', message.handoffId);
+        this.sendMessage({
+            type: 'playback.stopped',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            dispatchId: message.dispatchId,
+            handoffId: message.handoffId,
+        });
+        this.sendHeartbeat('idle');
+        this.stoppedExecution.resolve();
+    }
+
+    private sendHeartbeat(
+        playbackState: 'idle' | 'playing' | 'stopping',
+        activeHandoffId?: string,
+    ): void {
+        this.sendMessage({
+            type: 'worker.heartbeat',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString(),
+            playbackState,
+            activeHandoffId,
+        });
+    }
+
+    private sendMessage(message: Record<string, unknown>): void {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+
+        this.socket.send(JSON.stringify(message));
+    }
+
+    private createDeferred<T>() {
+        const state = {} as {
+            resolve?: (value: T | PromiseLike<T>) => void;
+            reject?: (reason?: unknown) => void;
+        };
+
+        const promise = new Promise<T>((resolve, reject) => {
+            state.resolve = resolve;
+            state.reject = reject;
+        });
+
+        return {
+            promise,
+            resolve: state.resolve!,
+            reject: state.reject!,
+        };
     }
 }
 
-/**
- * Keep routing payloads intentionally small so each test isolates one daemon behavior.
- */
 const createPayload = (basePath: string): PatchwalkHandoffPayload => {
     return {
         specVersion: '1.0.0',
@@ -169,7 +264,6 @@ const readTextResource = async (client: Client, uri: string): Promise<string> =>
     return firstContent.text;
 };
 
-// These integration tests exercise the daemon end to end: HTTP, MCP, and worker routing.
 describe('patchwalk mcp server', () => {
     let server: PatchwalkMcpServer;
     let endpointUrl: string;
@@ -217,6 +311,12 @@ describe('patchwalk mcp server', () => {
         strictEqual(health.activeSessionCount, 1);
         strictEqual(health.daemonPid > 0, true);
 
+        const statusUrl = endpointUrl.replace(/\/mcp$/, '/status');
+        const statusResponse = await fetch(statusUrl);
+        const status = (await statusResponse.json()) as PatchwalkStatusResource;
+        strictEqual(statusResponse.status, 200);
+        strictEqual(status.configuredPort, server.listeningPort);
+
         const resources = await client.listResources();
         const resourceUris = resources.resources.map((resource) => resource.uri).sort();
         deepStrictEqual(resourceUris, [
@@ -238,12 +338,21 @@ describe('patchwalk mcp server', () => {
             tools.tools.some((tool) => tool.name === PATCHWALK_PLAY_TOOL_NAME),
             true,
         );
-
-        const playTool = tools.tools.find((tool) => tool.name === PATCHWALK_PLAY_TOOL_NAME);
-        match(playTool?.description ?? '', /semantic patch explanations/);
+        strictEqual(
+            tools.tools.some((tool) => tool.name === PATCHWALK_STOP_TOOL_NAME),
+            true,
+        );
     });
 
-    it('reports worker and dispatch status through the status resource', async () => {
+    it('allows daemon status reads without opening extra MCP sessions', async () => {
+        const sessionCountBefore = server.activeSessionCount;
+        const status = await daemonClient.readStatusResource();
+
+        strictEqual(status.configuredPort, server.listeningPort);
+        strictEqual(server.activeSessionCount, sessionCountBefore);
+    });
+
+    it('reports worker and active-handoff status through the status resource', async () => {
         const projectRoot = '/tmp/patchwalk-project';
         const worker = new FakePatchwalkWorker(daemonClient, [projectRoot]);
         workers.push(worker);
@@ -257,6 +366,9 @@ describe('patchwalk mcp server', () => {
         strictEqual(statusResource.configuredPort, server.listeningPort);
         strictEqual(statusResource.workerCount, 1);
         strictEqual(statusResource.activeDispatchCount, 0);
+        strictEqual(statusResource.workers[0]?.connectionState, 'connected');
+        strictEqual(statusResource.workers[0]?.playbackState, 'idle');
+        strictEqual(statusResource.activeHandoff, null);
         deepStrictEqual(statusResource.workers[0]?.workspaceRoots, [projectRoot]);
     });
 
@@ -357,18 +469,114 @@ describe('patchwalk mcp server', () => {
         match(content[0]?.text ?? '', /No live Patchwalk window matched/);
     });
 
-    it('drops stale workers on the next request cycle', async () => {
-        await daemonClient.registerWorker({
-            workerId: randomUUID(),
-            processId: process.pid,
-            extensionVersion: 'stale-worker',
-            workspaceRoots: ['/tmp/stale-root'],
-            lastSeenAt: '2020-01-01T00:00:00Z',
-            apiVersion: PATCHWALK_WORKER_API_VERSION,
+    it('rejects a second playback while one handoff is active and allows stop', async () => {
+        const worker = new FakePatchwalkWorker(
+            daemonClient,
+            ['/tmp/patchwalk-project'],
+            'test-extension',
+            {
+                holdExecutionUntilStopped: true,
+            },
+        );
+        workers.push(worker);
+        await worker.start();
+
+        const firstPlayPromise = client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: createPayload('/tmp/patchwalk-project'),
         });
 
-        const health = await daemonClient.fetchHealth();
-        strictEqual(health.workerCount, 0);
+        await worker.startedExecution.promise;
+
+        const secondPlayResult = await client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: createPayload('/tmp/patchwalk-project'),
+        });
+        const secondContent = secondPlayResult.content as Array<{ type: string; text?: string }>;
+
+        strictEqual(secondPlayResult.isError, true);
+        match(secondContent[0]?.text ?? '', /already has an active handoff/);
+
+        const stopResult = await client.callTool({
+            name: PATCHWALK_STOP_TOOL_NAME,
+            arguments: {},
+        });
+        const stopContent = stopResult.structuredContent as
+            | {
+                  status?: string;
+                  handoffId?: string;
+                  workerId?: string;
+              }
+            | undefined;
+
+        strictEqual(stopResult.isError ?? false, false);
+        strictEqual(stopContent?.status, 'stopped');
+        strictEqual(stopContent?.workerId, worker.workerId);
+
+        const firstPlayResult = await firstPlayPromise;
+        strictEqual(firstPlayResult.isError, true);
+
+        const statusResource = JSON.parse(
+            await readTextResource(client, PATCHWALK_STATUS_RESOURCE_URI),
+        ) as PatchwalkStatusResource;
+        strictEqual(statusResource.activeHandoff, null);
+    });
+
+    it('returns an idle stop result when no handoff is active', async () => {
+        const stopResult = await client.callTool({
+            name: PATCHWALK_STOP_TOOL_NAME,
+            arguments: {},
+        });
+        const stopContent = stopResult.structuredContent as
+            | {
+                  status?: string;
+              }
+            | undefined;
+
+        strictEqual(stopResult.isError ?? false, false);
+        strictEqual(stopContent?.status, 'idle');
+    });
+
+    it('clears active state when the worker disconnects during stop', async () => {
+        const worker = new FakePatchwalkWorker(
+            daemonClient,
+            ['/tmp/patchwalk-project'],
+            'test-extension',
+            {
+                holdExecutionUntilStopped: true,
+                disconnectOnStop: true,
+            },
+        );
+        workers.push(worker);
+        await worker.start();
+
+        const firstPlayPromise = client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: createPayload('/tmp/patchwalk-project'),
+        });
+
+        await worker.startedExecution.promise;
+
+        const stopResult = await client.callTool({
+            name: PATCHWALK_STOP_TOOL_NAME,
+            arguments: {},
+        });
+        const stopContent = stopResult.structuredContent as
+            | {
+                  status?: string;
+              }
+            | undefined;
+
+        strictEqual(stopResult.isError ?? false, false);
+        strictEqual(stopContent?.status, 'stopped');
+
+        const firstPlayResult = await firstPlayPromise;
+        strictEqual(firstPlayResult.isError, true);
+
+        const statusResource = JSON.parse(
+            await readTextResource(client, PATCHWALK_STATUS_RESOURCE_URI),
+        ) as PatchwalkStatusResource;
+        strictEqual(statusResource.activeHandoff, null);
     });
 
     it('still serves the example payload and operator manual resources', async () => {
@@ -382,7 +590,8 @@ describe('patchwalk mcp server', () => {
             PATCHWALK_OPERATOR_MANUAL_RESOURCE_URI,
         );
         match(operatorManual, /basePath/);
-        match(operatorManual, /longest parent-path match/);
+        match(operatorManual, /exactly one active handoff/);
+        match(operatorManual, /patchwalk.stop/);
 
         const authoringGuide = await readTextResource(
             client,

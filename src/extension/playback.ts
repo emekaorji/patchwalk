@@ -5,51 +5,134 @@ import * as vscode from 'vscode';
 import type { PatchwalkHandoffPayload, PatchwalkWalkthroughStep } from '../lib/schema';
 import { speakWithSystemVoice } from './tts';
 
+export type PatchwalkPlaybackState = 'idle' | 'playing' | 'stopping';
+
+export interface PatchwalkPlaybackStateSnapshot {
+    state: PatchwalkPlaybackState;
+    activeHandoffId: string | null;
+}
+
+interface ActivePlaybackRun {
+    handoffId: string;
+    abortController: AbortController;
+    completion: Promise<void>;
+    resolveCompletion: () => void;
+    rejectCompletion: (error: Error) => void;
+}
+
+const createStoppedError = (): Error => {
+    const error = new Error('Patchwalk playback was stopped.');
+    error.name = 'PatchwalkPlaybackStoppedError';
+    return error;
+};
+
+const isStoppedError = (error: unknown): boolean => {
+    return error instanceof Error && error.name === 'PatchwalkPlaybackStoppedError';
+};
+
 /**
  * The playback runner owns every editor-side side effect: opening files, revealing ranges,
- * highlighting code, and narrating the handoff.
+ * highlighting code, narration, and stop handling for the active handoff.
  */
 export class PatchwalkPlaybackRunner implements vscode.Disposable {
     private readonly highlightDecoration: vscode.TextEditorDecorationType;
-    /**
-     * Serialize playbacks so overlapping MCP requests do not fight over the editor.
-     */
-    private playbackQueue: Promise<void> = Promise.resolve();
+    private activeRun: ActivePlaybackRun | undefined;
+    private state: PatchwalkPlaybackState = 'idle';
 
     public constructor(private readonly outputChannel: vscode.OutputChannel) {
-        // Reuse one decoration type so every step highlight looks identical across playbacks.
         this.highlightDecoration = vscode.window.createTextEditorDecorationType({
             isWholeLine: true,
             backgroundColor: new vscode.ThemeColor('editor.rangeHighlightBackground'),
         });
     }
 
-    public dispose() {
-        // Decorations are editor resources and should be released with the extension host.
+    public dispose(): void {
         this.highlightDecoration.dispose();
     }
 
-    public play(payload: PatchwalkHandoffPayload): Promise<void> {
-        // Queueing prevents multiple handoffs from fighting over focus, selections, and narration.
-        this.playbackQueue = this.playbackQueue
-            .catch(() => {
-                // Keep queue operational after a failed playback.
-            })
-            .then(async () => {
-                await this.playInternal(payload);
-            });
-
-        return this.playbackQueue;
+    public getStateSnapshot(): PatchwalkPlaybackStateSnapshot {
+        return {
+            state: this.state,
+            activeHandoffId: this.activeRun?.handoffId ?? null,
+        };
     }
 
-    private async playInternal(payload: PatchwalkHandoffPayload): Promise<void> {
-        this.outputChannel.appendLine(`Starting Patchwalk handoff: ${payload.handoffId}`);
-        await this.speak(payload.summary);
+    public async play(payload: PatchwalkHandoffPayload): Promise<void> {
+        if (this.activeRun) {
+            throw new Error(
+                `Patchwalk is already playing handoff ${this.activeRun.handoffId} in this window.`,
+            );
+        }
 
-        // Walkthrough order matters because the payload is authored as a guided explanation.
+        const abortController = new AbortController();
+        const completionState = {} as {
+            resolve?: () => void;
+            reject?: (error: Error) => void;
+        };
+        const completion = new Promise<void>((resolve, reject) => {
+            completionState.resolve = resolve;
+            completionState.reject = reject;
+        });
+
+        this.activeRun = {
+            handoffId: payload.handoffId,
+            abortController,
+            completion,
+            resolveCompletion: completionState.resolve!,
+            rejectCompletion: completionState.reject!,
+        };
+        this.state = 'playing';
+
+        this.playInternal(payload, abortController.signal)
+            .then(() => {
+                this.activeRun?.resolveCompletion();
+            })
+            .catch((error) => {
+                this.activeRun?.rejectCompletion(
+                    error instanceof Error ? error : new Error(String(error)),
+                );
+            })
+            .finally(() => {
+                this.activeRun = undefined;
+                this.state = 'idle';
+            });
+
+        return completion;
+    }
+
+    public async stopActivePlayback(): Promise<boolean> {
+        const activeRun = this.activeRun;
+        if (!activeRun) {
+            return false;
+        }
+
+        this.state = 'stopping';
+        activeRun.abortController.abort();
+
+        try {
+            await activeRun.completion;
+            return true;
+        } catch (error) {
+            if (isStoppedError(error)) {
+                return true;
+            }
+
+            throw error;
+        }
+    }
+
+    private async playInternal(
+        payload: PatchwalkHandoffPayload,
+        abortSignal: AbortSignal,
+    ): Promise<void> {
+        this.outputChannel.appendLine(`Starting Patchwalk handoff: ${payload.handoffId}`);
+        this.throwIfStopped(abortSignal);
+        await this.speak(payload.summary, abortSignal);
+
         await payload.walkthrough.reduce<Promise<void>>(async (queue, step) => {
             await queue;
-            await this.playStep(payload, step);
+            this.throwIfStopped(abortSignal);
+            await this.playStep(payload, step, abortSignal);
         }, Promise.resolve());
 
         this.outputChannel.appendLine(`Finished Patchwalk handoff: ${payload.handoffId}`);
@@ -58,6 +141,7 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
     private async playStep(
         payload: PatchwalkHandoffPayload,
         step: PatchwalkWalkthroughStep,
+        abortSignal: AbortSignal,
     ): Promise<void> {
         const fileUri = this.resolveFileUri(payload.basePath, step.path);
         if (!fileUri) {
@@ -83,18 +167,18 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
             return;
         }
 
+        this.throwIfStopped(abortSignal);
         const document = await vscode.workspace.openTextDocument(fileUri);
+        this.throwIfStopped(abortSignal);
         const editor = await vscode.window.showTextDocument(document, {
             preview: false,
             preserveFocus: false,
         });
 
-        // Clamp authored line ranges so out-of-date payloads do not explode on shorter files.
         const maximumLine = Math.max(document.lineCount - 1, 0);
         const startLine = Math.min(Math.max(step.range.startLine - 1, 0), maximumLine);
         const endLine = Math.min(Math.max(step.range.endLine - 1, startLine), maximumLine);
 
-        // Reveal the first line, but highlight the full step range so the speaker can narrate context.
         const revealRange = new vscode.Range(startLine, 0, startLine, 0);
         const endLineCharacter = document.lineAt(endLine).range.end.character;
         const highlightRange = new vscode.Range(startLine, 0, endLine, endLineCharacter);
@@ -104,7 +188,8 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
         editor.setDecorations(this.highlightDecoration, [highlightRange]);
 
         try {
-            await this.speak(step.narration);
+            this.throwIfStopped(abortSignal);
+            await this.speak(step.narration, abortSignal);
         } finally {
             editor.setDecorations(this.highlightDecoration, []);
         }
@@ -115,7 +200,6 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
             return vscode.Uri.file(filePath);
         }
 
-        // Relative walkthrough paths are anchored to the routed project root, not the active tab.
         if (!path.isAbsolute(basePath)) {
             return undefined;
         }
@@ -123,16 +207,29 @@ export class PatchwalkPlaybackRunner implements vscode.Disposable {
         return vscode.Uri.file(path.resolve(basePath, filePath));
     }
 
-    private async speak(text: string): Promise<void> {
+    private async speak(text: string, abortSignal: AbortSignal): Promise<void> {
         try {
-            await speakWithSystemVoice(text);
+            await speakWithSystemVoice(text, abortSignal);
         } catch (error) {
+            if (abortSignal.aborted) {
+                throw createStoppedError();
+            }
+
+            if (error instanceof Error && error.name === 'AbortError') {
+                throw createStoppedError();
+            }
+
             const message = error instanceof Error ? error.message : String(error);
-            // Narration failure should not prevent the editor walkthrough from finishing.
             this.outputChannel.appendLine(`TTS error: ${message}`);
             await vscode.window.showWarningMessage(
                 `Patchwalk TTS unavailable, skipping narration: ${message}`,
             );
+        }
+    }
+
+    private throwIfStopped(abortSignal: AbortSignal): void {
+        if (abortSignal.aborted) {
+            throw createStoppedError();
         }
     }
 }

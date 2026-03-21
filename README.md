@@ -15,8 +15,9 @@ On the first Patchwalk activation after install:
 
 1. the extension checks `GET /health` on the local daemon port
 2. if the daemon is down, the extension spawns the bundled Node daemon
-3. the window registers itself as a worker with its current workspace folder roots
-4. the worker starts heartbeats and long-polls for daemon events
+3. the window opens one persistent WebSocket connection to the daemon
+4. the worker registers its current workspace folder roots and playback state
+5. the worker sends heartbeat and workspace updates over that same socket
 
 If the daemon dies later, any live Patchwalk window will restart it and re-register.
 
@@ -40,30 +41,30 @@ If the daemon dies later, any live Patchwalk window will restart it and re-regis
 - Transport: stateful Streamable HTTP via `@modelcontextprotocol/sdk`
 - MCP methods handled on the endpoint: `POST`, `GET`, `DELETE`
 
-The daemon also exposes local worker-control endpoints used only by the extension windows:
+The daemon also exposes one private worker socket used only by extension windows:
 
-- `POST /workers`
-- `POST /workers/:workerId/heartbeat`
-- `GET /workers/:workerId/events`
-- `POST /workers/:workerId/claims`
-- `POST /workers/:workerId/results`
+- `ws://127.0.0.1:<patchwalk.daemonPort>/workers/connect`
 
 ## Routing contract
 
 Every handoff must include a root-level `basePath`.
 
 - `basePath` must be an absolute filesystem path.
-- Each worker compares `basePath` against its open workspace folder roots.
-- A worker may claim the handoff only when one of its workspace roots is:
-  - exactly equal to `basePath`, or
-  - a parent directory of `basePath`
-- Workers silently reject non-matches.
-- The daemon selects one winner using:
+- The daemon compares `basePath` against the registered workspace roots of every live worker.
+- The daemon routes directly to one worker using:
   - exact match first
   - otherwise longest parent-path match
   - otherwise earliest live registration
+- The daemon sends a lightweight `playback.prepare` message to the best candidate first.
+- If that worker is stale or unavailable, the daemon falls through to the next ranked worker.
+- Only the selected worker receives the actual `playback.execute` command.
 
-Only the selected worker receives the actual playback command.
+## Active handoff contract
+
+- Patchwalk allows exactly one active narration across the whole machine at a time.
+- If any worker is already playing or stopping a handoff, new `patchwalk.play` requests are rejected immediately.
+- Clipboard playback uses the same daemon path and is subject to the same single-active-handoff rule.
+- Use `patchwalk.stop` to stop the currently active narration globally.
 
 ## Minimal payload
 
@@ -96,6 +97,7 @@ Relative step paths resolve from `basePath`, not from the currently focused edit
 Tools:
 
 - `patchwalk.play`
+- `patchwalk.stop`
 
 Resources:
 
@@ -129,6 +131,7 @@ Expected result:
 2. the daemon status resource shows registered workers
 3. the handoff is routed to the best matching live window
 4. that window opens files, highlights ranges, and narrates the walkthrough
+5. if another handoff is already active, the daemon rejects the request until the active one completes or is stopped
 
 Before generating non-trivial payloads, read `patchwalk://handoff/authoring-guide`. It tells MCP clients to write semantic engineer-facing explanations with intent, risk, blast radius, behavior changes, tests, and architecture, while filtering out formatting-only noise.
 
@@ -164,6 +167,19 @@ Recovery:
 2. verify a Patchwalk-enabled window has the exact path open as a workspace root, or a parent of it open as a workspace root
 3. run `Patchwalk: Show Daemon Status` and inspect the registered worker roots
 4. resend the handoff
+
+### New handoff is rejected as already active
+
+Symptom:
+
+- MCP tool call returns an error saying another Patchwalk handoff is already active
+
+Recovery:
+
+1. run the MCP tool `patchwalk.stop`, or wait for the current narration to complete
+2. if you think nothing is active, run `Patchwalk: Show Daemon Status`
+3. inspect `activeHandoff` and each worker `playbackState`
+4. if the daemon state is stale, reload the worker window that still reports playback
 
 ### Wrong window wins routing
 

@@ -3,17 +3,23 @@ import path from 'node:path';
 import process from 'node:process';
 
 import * as vscode from 'vscode';
+import WebSocket from 'ws';
 
 import type {
-    PatchwalkPlaybackCancelEvent,
-    PatchwalkPlaybackClaimEvent,
-    PatchwalkPlaybackExecuteEvent,
-    PatchwalkWorkerEvent,
+    PatchwalkPlaybackExecuteMessage,
+    PatchwalkPlaybackFailedMessage,
+    PatchwalkPlaybackPrepareMessage,
+    PatchwalkPlaybackStopMessage,
+    PatchwalkWorkerHeartbeatMessage,
+    PatchwalkWorkerRegisterMessage,
+    PatchwalkWorkerToDaemonMessage,
+    PatchwalkWorkerUpdateMessage,
 } from '../lib/controlProtocol';
 import {
     PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS,
-    PATCHWALK_DEFAULT_POLL_INTERVAL_MS,
+    PATCHWALK_DEFAULT_RECONNECT_DELAY_MS,
     PATCHWALK_WORKER_API_VERSION,
+    patchwalkDaemonToWorkerMessageSchema,
 } from '../lib/controlProtocol';
 import { normalizeAbsolutePath } from '../lib/pathUtils';
 import { matchBasePathToWorkspaceRoots } from '../lib/routing';
@@ -21,10 +27,6 @@ import type { PatchwalkHandoffPayload } from '../lib/schema';
 import { PatchwalkDaemonClient } from './daemonClient';
 import type { PatchwalkPlaybackRunner } from './playback';
 
-/**
- * The worker controller is the extension-side control plane. It keeps the daemon alive, registers
- * this window's workspace roots, and translates daemon events into local playback actions.
- */
 interface PatchwalkWorkerControllerOptions {
     context: vscode.ExtensionContext;
     daemonPort: number;
@@ -32,26 +34,24 @@ interface PatchwalkWorkerControllerOptions {
     playbackRunner: PatchwalkPlaybackRunner;
 }
 
+/**
+ * The worker controller is the extension-side control plane. It keeps the daemon alive, maintains
+ * one persistent worker socket, and translates daemon messages into local playback actions.
+ */
 export class PatchwalkWorkerController implements vscode.Disposable {
-    /**
-     * Every window gets its own stable worker id so the daemon can track it across heartbeats.
-     */
     private readonly workerId = randomUUID();
     private readonly daemonClient: PatchwalkDaemonClient;
     private readonly disposables: vscode.Disposable[] = [];
     private heartbeatTimer: NodeJS.Timeout | undefined;
+    private reconnectTimer: NodeJS.Timeout | undefined;
+    private socket: WebSocket | undefined;
     private connectionPromise: Promise<void> | undefined;
-    private pollLoop: Promise<void> | undefined;
+    private messageQueue: Promise<void> = Promise.resolve();
     private stopping = false;
-    /**
-     * This flag lets the debug stop command keep the daemon down until the user opts back in.
-     */
     private daemonManagementEnabled = true;
     private heartbeatIntervalMs = PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS;
-    private pollIntervalMs = PATCHWALK_DEFAULT_POLL_INTERVAL_MS;
 
     public constructor(private readonly options: PatchwalkWorkerControllerOptions) {
-        // The extension always spawns the bundled daemon artifact rather than assuming a global install.
         this.daemonClient = new PatchwalkDaemonClient({
             daemonEntryPath: path.join(
                 options.context.extensionPath,
@@ -65,11 +65,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
     }
 
     public async start(): Promise<void> {
-        // Registration happens first so the window can participate in routing before polling starts.
-        await this.ensureConnected();
-
         this.disposables.push(
-            // Workspace ownership can change while the window is open, so keep the daemon updated.
             vscode.workspace.onDidChangeWorkspaceFolders(() => {
                 this.refreshRegistration().catch((error: unknown) => {
                     this.reportError('Patchwalk workspace registration refresh failed', error);
@@ -77,12 +73,19 @@ export class PatchwalkWorkerController implements vscode.Disposable {
             }),
         );
 
-        this.startHeartbeatLoop();
-        this.startPollLoop();
+        try {
+            await this.ensureConnected();
+        } catch (error) {
+            this.reportError('Patchwalk worker failed initial connection', error);
+            this.scheduleReconnect();
+        }
     }
 
     public async restartDaemon(): Promise<void> {
         this.daemonManagementEnabled = true;
+        this.clearReconnectTimer();
+        this.closeSocket();
+
         try {
             await this.daemonClient.shutdown();
         } catch {
@@ -90,21 +93,24 @@ export class PatchwalkWorkerController implements vscode.Disposable {
         }
 
         await this.ensureConnected();
-        this.startPollLoop();
     }
 
     public async showStatus(): Promise<void> {
-        await this.ensureConnected();
-        // Surface the daemon's own status resource so debugging uses the same truth as MCP clients.
         const status = await this.daemonClient.readStatusResource();
         this.options.outputChannel.clear();
         this.options.outputChannel.appendLine(JSON.stringify(status, null, 2));
         this.options.outputChannel.show(true);
+
+        // Status reads should still opportunistically heal a disconnected worker socket.
+        if (!this.isSocketOpen()) {
+            this.scheduleReconnect();
+        }
     }
 
     public async stopDaemon(): Promise<void> {
-        // This is a deliberate debug escape hatch, so also pause the self-healing behavior.
         this.daemonManagementEnabled = false;
+        this.clearReconnectTimer();
+        this.closeSocket();
         if (this.heartbeatTimer) {
             clearInterval(this.heartbeatTimer);
             this.heartbeatTimer = undefined;
@@ -114,56 +120,28 @@ export class PatchwalkWorkerController implements vscode.Disposable {
 
     public async routeClipboardPlayback(payload: PatchwalkHandoffPayload): Promise<void> {
         await this.ensureConnected();
-        // Clipboard playback intentionally goes through the daemon so manual tests exercise routing.
         await this.daemonClient.dispatchPlayback(payload);
     }
 
     public dispose(): void {
-        // Disposal only needs to stop timers and listeners; the daemon keeps running independently.
         this.stopping = true;
         if (this.heartbeatTimer) {
             clearInterval(this.heartbeatTimer);
         }
+        this.clearReconnectTimer();
+        this.closeSocket();
 
         for (const disposable of this.disposables) {
             disposable.dispose();
         }
     }
 
-    private startHeartbeatLoop(): void {
-        if (!this.daemonManagementEnabled) {
-            return;
-        }
-
-        if (this.heartbeatTimer) {
-            // Timer cadence can change after registration, so replace any older interval.
-            clearInterval(this.heartbeatTimer);
-        }
-
-        this.heartbeatTimer = setInterval(() => {
-            if (this.stopping) {
-                return;
-            }
-
-            this.sendHeartbeat().catch((error: unknown) => {
-                this.reportError('Patchwalk heartbeat failed', error);
-            });
-        }, this.heartbeatIntervalMs);
-    }
-
-    private startPollLoop(): void {
-        if (!this.daemonManagementEnabled || this.pollLoop) {
-            return;
-        }
-
-        // Keep one outstanding long-poll at a time per window to avoid duplicate event handling.
-        this.pollLoop = this.pollForEvents().finally(() => {
-            this.pollLoop = undefined;
-        });
-    }
-
     private async ensureConnected(): Promise<void> {
         if (!this.daemonManagementEnabled) {
+            return;
+        }
+
+        if (this.isSocketOpen()) {
             return;
         }
 
@@ -179,34 +157,88 @@ export class PatchwalkWorkerController implements vscode.Disposable {
     }
 
     private async ensureConnectedInternal(): Promise<void> {
-        // Health-check and auto-spawn are centralized inside the daemon client.
         await this.daemonClient.ensureServerRunning();
-
-        const registration = await this.daemonClient.registerWorker({
-            workerId: this.workerId,
-            processId: process.pid,
-            extensionVersion: this.options.context.extension.packageJSON.version,
-            workspaceRoots: await this.collectWorkspaceRoots(),
-            lastSeenAt: new Date().toISOString(),
-            apiVersion: PATCHWALK_WORKER_API_VERSION,
-        });
-
-        // The daemon is allowed to tune worker cadence over time without changing extension code.
-        this.heartbeatIntervalMs = registration.heartbeatIntervalMs;
-        this.pollIntervalMs = registration.pollIntervalMs;
+        await this.connectSocket();
         this.startHeartbeatLoop();
     }
 
-    private async refreshRegistration(): Promise<void> {
-        try {
-            // Re-registering is cheap and doubles as a daemon-reconnect path.
-            await this.ensureConnected();
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            this.options.outputChannel.appendLine(
-                `Patchwalk worker registration refresh failed: ${message}`,
-            );
+    private async connectSocket(): Promise<void> {
+        await new Promise<void>((resolve, reject) => {
+            const socket = new WebSocket(this.daemonClient.workerSocketUrl);
+            const handleError = (error: Error) => {
+                socket.off('error', handleError);
+                reject(error);
+            };
+
+            const handleOpen = () => {
+                socket.off('open', handleOpen);
+                socket.off('error', handleError);
+                this.bindSocket(socket);
+                this.sendMessage(this.createRegisterMessage()).then(resolve).catch(reject);
+            };
+
+            socket.once('open', handleOpen);
+            socket.once('error', handleError);
+        });
+    }
+
+    private bindSocket(socket: WebSocket): void {
+        this.closeSocket();
+        this.socket = socket;
+
+        socket.on('message', (rawData: WebSocket.RawData) => {
+            this.messageQueue = this.messageQueue
+                .catch(() => {
+                    // Keep the serial message queue alive after a failed handler.
+                })
+                .then(async () => {
+                    await this.handleSocketMessage(rawData);
+                });
+        });
+
+        socket.on('close', () => {
+            if (this.socket === socket) {
+                this.socket = undefined;
+            }
+
+            if (!this.stopping && this.daemonManagementEnabled) {
+                this.scheduleReconnect();
+            }
+        });
+
+        socket.on('error', (error: Error) => {
+            this.reportError('Patchwalk worker socket error', error);
+        });
+    }
+
+    private closeSocket(): void {
+        if (!this.socket) {
+            return;
         }
+
+        this.socket.removeAllListeners();
+        this.socket.close();
+        this.socket = undefined;
+    }
+
+    private startHeartbeatLoop(): void {
+        if (!this.daemonManagementEnabled) {
+            return;
+        }
+
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+        }
+
+        this.heartbeatTimer = setInterval(() => {
+            if (this.stopping) {
+                return;
+            }
+
+            this.sendHeartbeat().catch((error: unknown) => {
+                this.reportError('Patchwalk heartbeat failed', error);
+            });
+        }, this.heartbeatIntervalMs);
     }
 
     private async sendHeartbeat(): Promise<void> {
@@ -214,50 +246,231 @@ export class PatchwalkWorkerController implements vscode.Disposable {
             return;
         }
 
-        try {
-            await this.daemonClient.sendHeartbeat(this.workerId, {
-                workspaceRoots: await this.collectWorkspaceRoots(),
-                lastSeenAt: new Date().toISOString(),
-            });
-        } catch {
-            // Missing heartbeats usually mean the daemon restarted; reconnect instead of surfacing noise.
+        if (!this.isSocketOpen()) {
             await this.ensureConnected();
         }
+
+        await this.sendMessage(this.createHeartbeatMessage());
     }
 
-    private async pollForEvents(): Promise<void> {
-        if (this.stopping || !this.daemonManagementEnabled) {
+    private async refreshRegistration(): Promise<void> {
+        await this.ensureConnected();
+        await this.sendMessage(this.createUpdateMessage());
+    }
+
+    private scheduleReconnect(): void {
+        if (this.reconnectTimer || !this.daemonManagementEnabled) {
             return;
         }
 
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = undefined;
+            this.ensureConnected().catch((error: unknown) => {
+                this.reportError('Patchwalk worker reconnect failed', error);
+                this.scheduleReconnect();
+            });
+        }, PATCHWALK_DEFAULT_RECONNECT_DELAY_MS);
+    }
+
+    private clearReconnectTimer(): void {
+        if (!this.reconnectTimer) {
+            return;
+        }
+
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = undefined;
+    }
+
+    private async handleSocketMessage(rawData: WebSocket.RawData): Promise<void> {
+        let parsedValue: unknown;
         try {
-            const events = await this.daemonClient.pollEvents(
-                this.workerId,
-                Math.max(this.pollIntervalMs * 25, 10_000),
+            parsedValue = JSON.parse(String(rawData));
+        } catch {
+            this.options.outputChannel.appendLine(
+                'Patchwalk worker received non-JSON daemon message.',
             );
+            return;
+        }
 
-            // Preserve event order so claim/execute/cancel flow stays deterministic.
-            await events.reduce<Promise<void>>(async (queue, event) => {
-                await queue;
-                await this.handleEvent(event);
-            }, Promise.resolve());
+        const parsedMessage = patchwalkDaemonToWorkerMessageSchema.safeParse(parsedValue);
+        if (!parsedMessage.success) {
+            this.options.outputChannel.appendLine(
+                `Patchwalk worker received invalid daemon message: ${
+                    parsedMessage.error.issues[0]?.message ?? 'Unknown error'
+                }`,
+            );
+            return;
+        }
+
+        const message = parsedMessage.data;
+        switch (message.type) {
+            case 'playback.prepare':
+                await this.handlePrepareMessage(message);
+                return;
+            case 'playback.execute':
+                await this.handleExecuteMessage(message);
+                return;
+            case 'playback.stop':
+                await this.handleStopMessage(message);
+                return;
+            case 'worker.reconcile':
+                await this.refreshRegistration();
+                return;
+        }
+    }
+
+    private async handlePrepareMessage(message: PatchwalkPlaybackPrepareMessage): Promise<void> {
+        const workspaceRoots = await this.collectWorkspaceRoots();
+        const match = matchBasePathToWorkspaceRoots(message.basePath, workspaceRoots);
+        const playbackState = this.options.playbackRunner.getStateSnapshot();
+
+        if (!match || playbackState.state !== 'idle') {
+            await this.sendMessage(
+                this.createPlaybackFailedMessage(
+                    message.dispatchId,
+                    message.handoffId,
+                    'prepare',
+                    'unavailable',
+                    'Worker can no longer serve the requested basePath.',
+                ),
+            );
+        }
+    }
+
+    private async handleExecuteMessage(message: PatchwalkPlaybackExecuteMessage): Promise<void> {
+        try {
+            await this.options.playbackRunner.play(message.payload);
+            await this.sendMessage({
+                type: 'playback.completed',
+                messageId: randomUUID(),
+                workerId: this.workerId,
+                sentAt: new Date().toISOString(),
+                dispatchId: message.dispatchId,
+                handoffId: message.payload.handoffId,
+                stepsPlayed: message.payload.walkthrough.length,
+            });
         } catch (error) {
-            this.reportError('Patchwalk worker poll failed', error);
-
-            try {
-                await this.ensureConnected();
-            } catch (reconnectError) {
-                this.reportError('Patchwalk worker reconnect failed', reconnectError);
+            if (error instanceof Error && error.name === 'PatchwalkPlaybackStoppedError') {
+                return;
             }
 
-            await new Promise((resolve) => {
-                setTimeout(resolve, this.pollIntervalMs);
-            });
+            const messageText = error instanceof Error ? error.message : String(error);
+            await this.sendMessage(
+                this.createPlaybackFailedMessage(
+                    message.dispatchId,
+                    message.payload.handoffId,
+                    'execute',
+                    'execution_failed',
+                    messageText,
+                ),
+            );
         }
+    }
 
-        if (!this.stopping && this.daemonManagementEnabled) {
-            await this.pollForEvents();
+    private async handleStopMessage(message: PatchwalkPlaybackStopMessage): Promise<void> {
+        try {
+            const stopped = await this.options.playbackRunner.stopActivePlayback();
+            if (!stopped) {
+                await this.sendMessage(
+                    this.createPlaybackFailedMessage(
+                        message.dispatchId,
+                        message.handoffId,
+                        'stop',
+                        'unavailable',
+                        'No active Patchwalk playback was running in this worker.',
+                    ),
+                );
+                return;
+            }
+
+            await this.sendMessage({
+                type: 'playback.stopped',
+                messageId: randomUUID(),
+                workerId: this.workerId,
+                sentAt: new Date().toISOString(),
+                dispatchId: message.dispatchId,
+                handoffId: message.handoffId,
+            });
+        } catch (error) {
+            const messageText = error instanceof Error ? error.message : String(error);
+            await this.sendMessage(
+                this.createPlaybackFailedMessage(
+                    message.dispatchId,
+                    message.handoffId,
+                    'stop',
+                    'stop_failed',
+                    messageText,
+                ),
+            );
         }
+    }
+
+    private createRegisterMessage(): PatchwalkWorkerRegisterMessage {
+        return {
+            type: 'worker.register',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            processId: process.pid,
+            extensionVersion: this.options.context.extension.packageJSON.version,
+            workspaceRoots: [],
+            lastSeenAt: new Date().toISOString(),
+            apiVersion: PATCHWALK_WORKER_API_VERSION,
+            ...this.createWorkerRuntimeState(),
+        };
+    }
+
+    private createUpdateMessage(): PatchwalkWorkerUpdateMessage {
+        return {
+            type: 'worker.update',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            workspaceRoots: [],
+            lastSeenAt: new Date().toISOString(),
+            ...this.createWorkerRuntimeState(),
+        };
+    }
+
+    private createHeartbeatMessage(): PatchwalkWorkerHeartbeatMessage {
+        return {
+            type: 'worker.heartbeat',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString(),
+            ...this.createWorkerRuntimeState(),
+        };
+    }
+
+    private createPlaybackFailedMessage(
+        dispatchId: string,
+        handoffId: string,
+        phase: PatchwalkPlaybackFailedMessage['phase'],
+        reasonCode: PatchwalkPlaybackFailedMessage['reasonCode'],
+        error: string,
+    ): PatchwalkPlaybackFailedMessage {
+        return {
+            type: 'playback.failed',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            dispatchId,
+            handoffId,
+            phase,
+            reasonCode,
+            error,
+        };
+    }
+
+    private createWorkerRuntimeState() {
+        const playbackState = this.options.playbackRunner.getStateSnapshot();
+        return {
+            playbackState: playbackState.state,
+            ...(playbackState.activeHandoffId
+                ? { activeHandoffId: playbackState.activeHandoffId }
+                : {}),
+        };
     }
 
     private async collectWorkspaceRoots(): Promise<string[]> {
@@ -268,78 +481,41 @@ export class PatchwalkWorkerController implements vscode.Disposable {
             ),
         );
 
-        // Sort roots so duplicate registrations are stable and easy to compare server-side.
         return [...new Set(normalizedRoots)].sort((leftRoot, rightRoot) =>
             leftRoot.localeCompare(rightRoot),
         );
     }
 
-    private async handleEvent(event: PatchwalkWorkerEvent): Promise<void> {
-        // Worker events are intentionally exhaustive so unexpected daemon messages fail at the type level.
-        switch (event.type) {
-            case 'playback.claim':
-                await this.handleClaimEvent(event);
-                return;
-            case 'playback.execute':
-                await this.handleExecuteEvent(event);
-                return;
-            case 'playback.cancel':
-                this.handleCancelEvent(event);
-                return;
-            case 'worker.reconcile':
-                await this.refreshRegistration();
-                return;
-        }
-    }
-
-    private async handleClaimEvent(event: PatchwalkPlaybackClaimEvent): Promise<void> {
-        // Workers decide only whether they can serve the base path, never whether they should win.
-        const workspaceRoots = await this.collectWorkspaceRoots();
-        const match = matchBasePathToWorkspaceRoots(event.basePath, workspaceRoots);
-
-        if (!match) {
-            await this.daemonClient.submitClaim(this.workerId, {
-                dispatchId: event.dispatchId,
-                accepted: false,
-            });
-            return;
+    private async sendMessage(message: PatchwalkWorkerToDaemonMessage): Promise<void> {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+            throw new Error('Patchwalk worker socket is not connected.');
         }
 
-        // The daemon still chooses the winner; the worker only reports the best local match it sees.
-        await this.daemonClient.submitClaim(this.workerId, {
-            dispatchId: event.dispatchId,
-            accepted: true,
-            matchedRoot: match.matchedRoot,
-            matchKind: match.matchKind,
-        });
-    }
-
-    private async handleExecuteEvent(event: PatchwalkPlaybackExecuteEvent): Promise<void> {
-        try {
-            // The actual editor-side side effects stay isolated inside the playback runner.
-            await this.options.playbackRunner.play(event.payload);
-            await this.daemonClient.submitResult(this.workerId, {
-                dispatchId: event.dispatchId,
-                handoffId: event.payload.handoffId,
-                status: 'completed',
-                stepsPlayed: event.payload.walkthrough.length,
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            // Report execution failures back to the daemon so the MCP caller receives a real error.
-            await this.daemonClient.submitResult(this.workerId, {
-                dispatchId: event.dispatchId,
-                handoffId: event.payload.handoffId,
-                status: 'failed',
-                error: message,
-            });
+        let enrichedMessage: PatchwalkWorkerToDaemonMessage = message;
+        if (message.type === 'worker.register' || message.type === 'worker.update') {
+            enrichedMessage = {
+                ...message,
+                workspaceRoots: await this.collectWorkspaceRoots(),
+                lastSeenAt: new Date().toISOString(),
+                ...this.createWorkerRuntimeState(),
+            };
+        } else if (message.type === 'worker.heartbeat') {
+            enrichedMessage = {
+                ...message,
+                lastSeenAt: new Date().toISOString(),
+                ...this.createWorkerRuntimeState(),
+            };
         }
+
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+            throw new Error('Patchwalk worker socket disconnected before the message was sent.');
+        }
+
+        this.socket.send(JSON.stringify(enrichedMessage));
     }
 
-    private handleCancelEvent(event: PatchwalkPlaybackCancelEvent): void {
-        this.options.outputChannel.appendLine(
-            `Patchwalk dispatch ${event.dispatchId} was cancelled: ${event.reason}`,
-        );
+    private isSocketOpen(): boolean {
+        return this.socket?.readyState === WebSocket.OPEN;
     }
 
     private reportError(contextMessage: string, error: unknown): void {

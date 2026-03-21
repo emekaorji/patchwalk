@@ -3,151 +3,168 @@ import { z } from 'zod';
 import { patchwalkHandoffPayloadSchema } from './schema';
 
 /**
- * The daemon and every live editor window speak this local control protocol. Keeping it in one file
- * makes it obvious which messages belong to the extension-facing transport and which belong to the
- * public MCP surface.
+ * The daemon and every editor worker speak this private protocol over WebSocket. The MCP surface
+ * remains public HTTP, while this contract stays focused on routing, liveness, and playback state.
  */
 const nonEmptyStringSchema = z.string().min(1).regex(/\S/, 'must not be blank.');
-// IDs, process ids, and interval values are always positive integers in this transport.
 const positiveIntegerSchema = z.number().int().gte(1);
 
-// Version the private worker protocol separately from the public handoff schema.
-export const PATCHWALK_WORKER_API_VERSION = '1.0.0';
-export const PATCHWALK_DEFAULT_POLL_INTERVAL_MS = 1_000;
+export const PATCHWALK_WORKER_API_VERSION = '2.0.0';
 export const PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
+export const PATCHWALK_DEFAULT_RECONNECT_DELAY_MS = 1_000;
+export const PATCHWALK_DEFAULT_PREPARE_TIMEOUT_MS = 300;
+export const PATCHWALK_DEFAULT_STOP_TIMEOUT_MS = 10_000;
+export const PATCHWALK_WORKER_SOCKET_PATH = '/workers/connect';
 
-// Workers describe who they are and which workspace roots they currently own.
-export const patchwalkWorkerRegistrationSchema = z.strictObject({
+export const patchwalkPlaybackStateSchema = z.enum(['idle', 'playing', 'stopping']);
+export const patchwalkPlaybackFailurePhaseSchema = z.enum(['prepare', 'execute', 'stop']);
+export const patchwalkPlaybackFailureReasonCodeSchema = z.enum([
+    'stale',
+    'unavailable',
+    'execution_failed',
+    'stop_failed',
+]);
+
+const patchwalkWorkerPlaybackStateFieldsSchema = z
+    .strictObject({
+        playbackState: patchwalkPlaybackStateSchema,
+        activeHandoffId: nonEmptyStringSchema.optional(),
+    })
+    .superRefine((value, context) => {
+        if (value.playbackState === 'idle' && value.activeHandoffId) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: 'Idle worker state must not include activeHandoffId.',
+                path: ['activeHandoffId'],
+            });
+        }
+
+        if (value.playbackState !== 'idle' && !value.activeHandoffId) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: 'Active playback states must include activeHandoffId.',
+                path: ['activeHandoffId'],
+            });
+        }
+    });
+
+const patchwalkWorkerMessageBaseSchema = z.strictObject({
+    messageId: nonEmptyStringSchema,
     workerId: nonEmptyStringSchema,
-    processId: positiveIntegerSchema,
-    extensionVersion: nonEmptyStringSchema,
-    workspaceRoots: z.array(nonEmptyStringSchema),
-    lastSeenAt: z.iso.datetime({ offset: true }),
-    apiVersion: z.literal(PATCHWALK_WORKER_API_VERSION),
+    sentAt: z.iso.datetime({ offset: true }),
 });
 
-// The daemon controls poll/heartbeat cadence so it can be tuned centrally later.
-export const patchwalkWorkerRegistrationResponseSchema = z.strictObject({
+const patchwalkDaemonMessageBaseSchema = z.strictObject({
+    messageId: nonEmptyStringSchema,
     workerId: nonEmptyStringSchema,
-    daemonPid: positiveIntegerSchema.optional(),
-    pollIntervalMs: positiveIntegerSchema,
-    heartbeatIntervalMs: positiveIntegerSchema,
+    sentAt: z.iso.datetime({ offset: true }),
 });
 
-// Heartbeats refresh liveness and let workers publish workspace root changes.
-export const patchwalkWorkerHeartbeatSchema = z.strictObject({
-    workspaceRoots: z.array(nonEmptyStringSchema),
-    lastSeenAt: z.iso.datetime({ offset: true }),
+export const patchwalkWorkerRegisterMessageSchema = patchwalkWorkerMessageBaseSchema
+    .extend({
+        type: z.literal('worker.register'),
+        processId: positiveIntegerSchema,
+        extensionVersion: nonEmptyStringSchema,
+        workspaceRoots: z.array(nonEmptyStringSchema),
+        lastSeenAt: z.iso.datetime({ offset: true }),
+        apiVersion: z.literal(PATCHWALK_WORKER_API_VERSION),
+    })
+    .merge(patchwalkWorkerPlaybackStateFieldsSchema);
+
+export const patchwalkWorkerUpdateMessageSchema = patchwalkWorkerMessageBaseSchema
+    .extend({
+        type: z.literal('worker.update'),
+        workspaceRoots: z.array(nonEmptyStringSchema),
+        lastSeenAt: z.iso.datetime({ offset: true }),
+    })
+    .merge(patchwalkWorkerPlaybackStateFieldsSchema);
+
+export const patchwalkWorkerHeartbeatMessageSchema = patchwalkWorkerMessageBaseSchema
+    .extend({
+        type: z.literal('worker.heartbeat'),
+        lastSeenAt: z.iso.datetime({ offset: true }),
+    })
+    .merge(patchwalkWorkerPlaybackStateFieldsSchema);
+
+export const patchwalkPlaybackCompletedMessageSchema = patchwalkWorkerMessageBaseSchema.extend({
+    type: z.literal('playback.completed'),
+    dispatchId: nonEmptyStringSchema,
+    handoffId: nonEmptyStringSchema,
+    stepsPlayed: positiveIntegerSchema,
 });
 
-// Claim events are intentionally small because they fan out to every live worker.
-export const patchwalkPlaybackClaimEventSchema = z.strictObject({
-    type: z.literal('playback.claim'),
-    eventId: nonEmptyStringSchema,
+export const patchwalkPlaybackFailedMessageSchema = patchwalkWorkerMessageBaseSchema.extend({
+    type: z.literal('playback.failed'),
+    dispatchId: nonEmptyStringSchema,
+    handoffId: nonEmptyStringSchema,
+    phase: patchwalkPlaybackFailurePhaseSchema,
+    reasonCode: patchwalkPlaybackFailureReasonCodeSchema,
+    error: nonEmptyStringSchema,
+});
+
+export const patchwalkPlaybackStoppedMessageSchema = patchwalkWorkerMessageBaseSchema.extend({
+    type: z.literal('playback.stopped'),
+    dispatchId: nonEmptyStringSchema,
+    handoffId: nonEmptyStringSchema,
+});
+
+export const patchwalkWorkerToDaemonMessageSchema = z.discriminatedUnion('type', [
+    patchwalkWorkerRegisterMessageSchema,
+    patchwalkWorkerUpdateMessageSchema,
+    patchwalkWorkerHeartbeatMessageSchema,
+    patchwalkPlaybackCompletedMessageSchema,
+    patchwalkPlaybackFailedMessageSchema,
+    patchwalkPlaybackStoppedMessageSchema,
+]);
+
+export const patchwalkPlaybackPrepareMessageSchema = patchwalkDaemonMessageBaseSchema.extend({
+    type: z.literal('playback.prepare'),
     dispatchId: nonEmptyStringSchema,
     handoffId: nonEmptyStringSchema,
     basePath: nonEmptyStringSchema,
 });
 
-// Execute events carry the validated payload only after one worker wins routing.
-export const patchwalkPlaybackExecuteEventSchema = z.strictObject({
+export const patchwalkPlaybackExecuteMessageSchema = patchwalkDaemonMessageBaseSchema.extend({
     type: z.literal('playback.execute'),
-    eventId: nonEmptyStringSchema,
     dispatchId: nonEmptyStringSchema,
     payload: patchwalkHandoffPayloadSchema,
 });
 
-export const patchwalkPlaybackCancelEventSchema = z.strictObject({
-    type: z.literal('playback.cancel'),
-    eventId: nonEmptyStringSchema,
+export const patchwalkPlaybackStopMessageSchema = patchwalkDaemonMessageBaseSchema.extend({
+    type: z.literal('playback.stop'),
     dispatchId: nonEmptyStringSchema,
+    handoffId: nonEmptyStringSchema,
     reason: nonEmptyStringSchema,
 });
 
-// Reconcile tells workers to discard long-poll state and resynchronize.
-export const patchwalkWorkerReconcileEventSchema = z.strictObject({
+export const patchwalkWorkerReconcileMessageSchema = patchwalkDaemonMessageBaseSchema.extend({
     type: z.literal('worker.reconcile'),
-    eventId: nonEmptyStringSchema,
+    reason: nonEmptyStringSchema,
 });
 
-// The worker event stream is closed-world on purpose so unexpected messages fail fast.
-export const patchwalkWorkerEventSchema = z.discriminatedUnion('type', [
-    patchwalkPlaybackClaimEventSchema,
-    patchwalkPlaybackExecuteEventSchema,
-    patchwalkPlaybackCancelEventSchema,
-    patchwalkWorkerReconcileEventSchema,
+export const patchwalkDaemonToWorkerMessageSchema = z.discriminatedUnion('type', [
+    patchwalkPlaybackPrepareMessageSchema,
+    patchwalkPlaybackExecuteMessageSchema,
+    patchwalkPlaybackStopMessageSchema,
+    patchwalkWorkerReconcileMessageSchema,
 ]);
 
-export const patchwalkWorkerEventsResponseSchema = z.strictObject({
-    events: z.array(patchwalkWorkerEventSchema),
-    pollIntervalMs: positiveIntegerSchema,
-});
-
-// Accepted claims must be specific enough for deterministic winner selection.
-export const patchwalkWorkerClaimSchema = z
-    .strictObject({
-        dispatchId: nonEmptyStringSchema,
-        accepted: z.boolean(),
-        matchedRoot: nonEmptyStringSchema.optional(),
-        matchKind: z.enum(['exact', 'parent']).optional(),
-    })
-    .superRefine((value, context) => {
-        // Accepted claims must carry enough information for the daemon to rank them centrally.
-        if (value.accepted && (!value.matchedRoot || !value.matchKind)) {
-            context.addIssue({
-                code: z.ZodIssueCode.custom,
-                message: 'Accepted claims must include matchedRoot and matchKind.',
-                path: ['accepted'],
-            });
-        }
-
-        if (!value.accepted && (value.matchedRoot || value.matchKind)) {
-            context.addIssue({
-                code: z.ZodIssueCode.custom,
-                message: 'Rejected claims must not include matchedRoot or matchKind.',
-                path: ['accepted'],
-            });
-        }
-    });
-
-// Worker results are the only thing that can complete an in-flight dispatch.
-export const patchwalkWorkerResultSchema = z
-    .strictObject({
-        dispatchId: nonEmptyStringSchema,
-        handoffId: nonEmptyStringSchema,
-        status: z.enum(['completed', 'failed']),
-        stepsPlayed: positiveIntegerSchema.optional(),
-        error: nonEmptyStringSchema.optional(),
-    })
-    .superRefine((value, context) => {
-        // Completed and failed results intentionally have different required fields.
-        if (value.status === 'completed' && value.stepsPlayed === undefined) {
-            context.addIssue({
-                code: z.ZodIssueCode.custom,
-                message: 'Completed results must include stepsPlayed.',
-                path: ['stepsPlayed'],
-            });
-        }
-
-        if (value.status === 'failed' && !value.error) {
-            context.addIssue({
-                code: z.ZodIssueCode.custom,
-                message: 'Failed results must include error.',
-                path: ['error'],
-            });
-        }
-    });
-
-export type PatchwalkWorkerRegistration = z.infer<typeof patchwalkWorkerRegistrationSchema>;
-export type PatchwalkWorkerRegistrationResponse = z.infer<
-    typeof patchwalkWorkerRegistrationResponseSchema
+export type PatchwalkPlaybackState = z.infer<typeof patchwalkPlaybackStateSchema>;
+export type PatchwalkPlaybackFailurePhase = z.infer<typeof patchwalkPlaybackFailurePhaseSchema>;
+export type PatchwalkPlaybackFailureReasonCode = z.infer<
+    typeof patchwalkPlaybackFailureReasonCodeSchema
 >;
-export type PatchwalkWorkerHeartbeat = z.infer<typeof patchwalkWorkerHeartbeatSchema>;
-export type PatchwalkPlaybackClaimEvent = z.infer<typeof patchwalkPlaybackClaimEventSchema>;
-export type PatchwalkPlaybackExecuteEvent = z.infer<typeof patchwalkPlaybackExecuteEventSchema>;
-export type PatchwalkPlaybackCancelEvent = z.infer<typeof patchwalkPlaybackCancelEventSchema>;
-export type PatchwalkWorkerReconcileEvent = z.infer<typeof patchwalkWorkerReconcileEventSchema>;
-export type PatchwalkWorkerEvent = z.infer<typeof patchwalkWorkerEventSchema>;
-export type PatchwalkWorkerEventsResponse = z.infer<typeof patchwalkWorkerEventsResponseSchema>;
-export type PatchwalkWorkerClaim = z.infer<typeof patchwalkWorkerClaimSchema>;
-export type PatchwalkWorkerResult = z.infer<typeof patchwalkWorkerResultSchema>;
+export type PatchwalkWorkerRegisterMessage = z.infer<typeof patchwalkWorkerRegisterMessageSchema>;
+export type PatchwalkWorkerUpdateMessage = z.infer<typeof patchwalkWorkerUpdateMessageSchema>;
+export type PatchwalkWorkerHeartbeatMessage = z.infer<typeof patchwalkWorkerHeartbeatMessageSchema>;
+export type PatchwalkPlaybackCompletedMessage = z.infer<
+    typeof patchwalkPlaybackCompletedMessageSchema
+>;
+export type PatchwalkPlaybackFailedMessage = z.infer<typeof patchwalkPlaybackFailedMessageSchema>;
+export type PatchwalkPlaybackStoppedMessage = z.infer<typeof patchwalkPlaybackStoppedMessageSchema>;
+export type PatchwalkWorkerToDaemonMessage = z.infer<typeof patchwalkWorkerToDaemonMessageSchema>;
+export type PatchwalkPlaybackPrepareMessage = z.infer<typeof patchwalkPlaybackPrepareMessageSchema>;
+export type PatchwalkPlaybackExecuteMessage = z.infer<typeof patchwalkPlaybackExecuteMessageSchema>;
+export type PatchwalkPlaybackStopMessage = z.infer<typeof patchwalkPlaybackStopMessageSchema>;
+export type PatchwalkWorkerReconcileMessage = z.infer<typeof patchwalkWorkerReconcileMessageSchema>;
+export type PatchwalkDaemonToWorkerMessage = z.infer<typeof patchwalkDaemonToWorkerMessageSchema>;
