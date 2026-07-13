@@ -16,8 +16,10 @@ import type {
 import { PATCHWALK_WORKER_API_VERSION } from '../src/lib/controlProtocol';
 import type { PatchwalkStatusResource } from '../src/lib/mcpCatalog';
 import {
+    createPatchwalkExampleHandoff,
     PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
     PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
+    PATCHWALK_COMPOSE_ONBOARDING_PROMPT_NAME,
     PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
     PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME,
     PATCHWALK_OPERATOR_MANUAL_RESOURCE_URI,
@@ -27,6 +29,7 @@ import {
 } from '../src/lib/mcpCatalog';
 import { matchBasePathToWorkspaceRoots } from '../src/lib/routing';
 import type { PatchwalkHandoffPayload } from '../src/lib/schema';
+import { patchwalkHandoffPayloadSchema } from '../src/lib/schema';
 
 interface PatchwalkHealthResponse {
     ok: boolean;
@@ -38,13 +41,23 @@ interface PatchwalkHealthResponse {
 }
 
 interface FakePatchwalkWorkerOptions {
+    narrationStyle?: 'terse' | 'grounded';
     holdExecutionUntilStopped?: boolean;
     disconnectOnStop?: boolean;
+    /** Simulate a wedged/zombie window: it matches routing but never sends playback.ready. */
+    neverReady?: boolean;
+}
+
+interface WalkOwnerCapture {
+    active: boolean;
+    ownerWorkerId?: string;
+    revealPath?: string;
 }
 
 class FakePatchwalkWorker {
     public readonly workerId = randomUUID();
     public readonly executedPayloads: PatchwalkHandoffPayload[] = [];
+    public readonly ownerMessages: WalkOwnerCapture[] = [];
     public readonly startedExecution = this.createDeferred<void>();
     public readonly stoppedExecution = this.createDeferred<void>();
     private socket: WebSocket | undefined;
@@ -81,6 +94,7 @@ class FakePatchwalkWorker {
             lastSeenAt: options.lastSeenAt ?? new Date().toISOString(),
             apiVersion: PATCHWALK_WORKER_API_VERSION,
             playbackState: 'idle',
+            ...(this.options.narrationStyle ? { narrationStyle: this.options.narrationStyle } : {}),
         });
 
         await new Promise((resolve) => {
@@ -118,6 +132,13 @@ class FakePatchwalkWorker {
             case 'worker.reconcile':
                 this.sendHeartbeat('idle');
                 return;
+            case 'walk.owner':
+                this.ownerMessages.push({
+                    active: message.active,
+                    ownerWorkerId: message.ownerWorkerId,
+                    revealPath: message.revealPath,
+                });
+                return;
         }
     }
 
@@ -126,8 +147,22 @@ class FakePatchwalkWorker {
         handoffId: string;
         basePath: string;
     }): Promise<void> {
+        if (this.options.neverReady) {
+            // A wedged window: it received prepare but never positively acks. The daemon must
+            // time out and fail over rather than hang.
+            return;
+        }
+
         const matchForWorker = matchBasePathToWorkspaceRoots(message.basePath, this.workspaceRoots);
         if (matchForWorker) {
+            this.sendMessage({
+                type: 'playback.ready',
+                messageId: randomUUID(),
+                workerId: this.workerId,
+                sentAt: new Date().toISOString(),
+                dispatchId: message.dispatchId,
+                handoffId: message.handoffId,
+            });
             return;
         }
 
@@ -146,6 +181,16 @@ class FakePatchwalkWorker {
 
     private async handleExecuteMessage(message: PatchwalkPlaybackExecuteMessage): Promise<void> {
         this.executedPayloads.push(message.payload);
+        // Launch ack: the daemon resolves patchwalk.play on this.
+        this.sendMessage({
+            type: 'playback.started',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            dispatchId: message.dispatchId,
+            handoffId: message.payload.handoffId,
+            stepCount: message.payload.walkthrough.length + 1,
+        });
         this.sendHeartbeat('playing', message.payload.handoffId);
         this.startedExecution.resolve();
 
@@ -330,6 +375,7 @@ describe('patchwalk mcp server', () => {
         const promptNames = prompts.prompts.map((prompt) => prompt.name).sort();
         deepStrictEqual(promptNames, [
             PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
+            PATCHWALK_COMPOSE_ONBOARDING_PROMPT_NAME,
             PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME,
         ]);
 
@@ -341,6 +387,162 @@ describe('patchwalk mcp server', () => {
         strictEqual(
             tools.tools.some((tool) => tool.name === PATCHWALK_STOP_TOOL_NAME),
             true,
+        );
+    });
+
+    it('advertises only API-legal property keys on every tool (no `$schema`, no 400)', async () => {
+        // Model providers require tool input property keys to match this pattern. A single illegal
+        // key (e.g. a leading `$`) makes the provider reject the WHOLE tools list with a 400, which
+        // breaks every turn for the user — not just this tool. Guard all tools, not just play.
+        const legalKeyPattern = /^[\w.-]{1,64}$/;
+        const tools = await client.listTools();
+
+        for (const tool of tools.tools) {
+            const properties = (tool.inputSchema as { properties?: Record<string, unknown> })
+                .properties;
+            for (const key of Object.keys(properties ?? {})) {
+                ok(
+                    legalKeyPattern.test(key),
+                    `tool ${tool.name} advertises an illegal property key: "${key}"`,
+                );
+            }
+        }
+
+        const playTool = tools.tools.find((tool) => tool.name === PATCHWALK_PLAY_TOOL_NAME);
+        const playProperties = (playTool?.inputSchema as { properties?: Record<string, unknown> })
+            .properties;
+        // `$schema` must not be advertised...
+        strictEqual('$schema' in (playProperties ?? {}), false);
+        // ...but must still be ACCEPTED by the payload validator when an agent sends it.
+        const withSchemaPointer = {
+            ...createPayload('/tmp/schema-pointer'),
+            $schema: 'https://patchwalk.dev/handoff.schema.json',
+        };
+        strictEqual(patchwalkHandoffPayloadSchema.safeParse(withSchemaPointer).success, true);
+    });
+
+    it('publishes the brevity gate to the agent as maxLength in the tool schema', async () => {
+        // The strongest gate is the one the model sees WHILE it writes. Guidance alone did not hold.
+        const tools = await client.listTools();
+        const playTool = tools.tools.find((tool) => tool.name === PATCHWALK_PLAY_TOOL_NAME);
+        const properties = (playTool?.inputSchema as { properties?: Record<string, any> })
+            .properties;
+
+        strictEqual(properties?.summary?.maxLength, 350);
+        const step = properties?.walkthrough?.items?.properties;
+        strictEqual(step?.narration?.maxLength, 220);
+        strictEqual(step?.title?.maxLength, 60);
+        strictEqual(step?.segments?.items?.properties?.narration?.maxLength, 150);
+    });
+
+    it('rebuilds the agent contract when a window reports the GROUNDED style', async () => {
+        // The style is machine-wide and reaches the daemon over the worker socket. A session opened
+        // AFTER the daemon learns it must serve the grounded caps.
+        const worker = new FakePatchwalkWorker(
+            daemonClient,
+            ['/tmp/style-root'],
+            'test-extension',
+            {
+                narrationStyle: 'grounded',
+            },
+        );
+        workers.push(worker);
+        await worker.start();
+
+        const styledClient = new Client({ name: 'styled', version: '1.0.0' });
+        const styledTransport = new StreamableHTTPClientTransport(new URL(endpointUrl));
+        await styledClient.connect(styledTransport);
+        try {
+            const tools = await styledClient.listTools();
+            const playTool = tools.tools.find((tool) => tool.name === PATCHWALK_PLAY_TOOL_NAME);
+            const properties = (playTool?.inputSchema as { properties?: Record<string, any> })
+                .properties;
+
+            strictEqual(properties?.summary?.maxLength, 700);
+            const step = properties?.walkthrough?.items?.properties;
+            strictEqual(step?.narration?.maxLength, 500);
+            strictEqual(step?.segments?.items?.properties?.narration?.maxLength, 320);
+            match(playTool?.description ?? '', /GROUNDED/);
+
+            const guide = await readTextResource(
+                styledClient,
+                PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
+            );
+            match(guide, /GROUNDED/);
+        } finally {
+            await Promise.allSettled([styledTransport.terminateSession(), styledTransport.close()]);
+        }
+    });
+
+    it('ships an example handoff that MODELS high-signal density (not just under the cap)', () => {
+        const example = createPatchwalkExampleHandoff();
+        // The example is what agents copy, so it must demonstrate the target density.
+        ok(example.summary.length <= 120, `example summary is ${example.summary.length} chars`);
+        for (const step of example.walkthrough) {
+            ok(step.narration.length <= 150, `step narration is ${step.narration.length} chars`);
+            for (const segment of step.segments ?? []) {
+                ok(
+                    segment.narration.length <= 110,
+                    `example sub-segment should be 40-110 chars, got ${segment.narration.length}: "${segment.narration}"`,
+                );
+            }
+        }
+    });
+
+    it('advertises a fully-typed play tool JSON Schema (nested fields, not degenerate)', async () => {
+        // Regression guard for the schema bug: registering with a Zod union/object instead of a
+        // ZodRawShape emitted `properties: {}`, which made agent CLIs string-coerce nested fields.
+        const tools = await client.listTools();
+        const playTool = tools.tools.find((tool) => tool.name === PATCHWALK_PLAY_TOOL_NAME);
+        ok(playTool, 'the play tool should be listed');
+        const schema = playTool.inputSchema as {
+            type?: string;
+            properties?: Record<string, { type?: string }>;
+            required?: string[];
+        };
+        strictEqual(schema.type, 'object');
+        strictEqual(schema.properties?.walkthrough?.type, 'array');
+        strictEqual(schema.properties?.producer?.type, 'object');
+        strictEqual(schema.properties?.basePath?.type, 'string');
+        ok(schema.required?.includes('walkthrough'), 'walkthrough must be required');
+        ok(schema.required?.includes('producer'), 'producer must be required');
+        ok(schema.required?.includes('basePath'), 'basePath must be required');
+    });
+
+    it('accepts and routes a nested walk that carries sub-segments', async () => {
+        const worker = new FakePatchwalkWorker(daemonClient, ['/tmp/segmented-root']);
+        workers.push(worker);
+        await worker.start();
+
+        const payload = createPayload('/tmp/segmented-root');
+        payload.walkthrough[0].segments = [
+            {
+                id: 'a',
+                narration: 'The first beat of the step.',
+                range: { startLine: 5, endLine: 8 },
+            },
+            { narration: 'The second, narrower beat.', range: { startLine: 9, endLine: 12 } },
+        ];
+
+        const playResult = await client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: payload,
+        });
+
+        strictEqual(playResult.isError ?? false, false);
+        strictEqual(worker.executedPayloads.length, 1);
+        deepStrictEqual(worker.executedPayloads[0]?.walkthrough[0]?.segments?.length, 2);
+    });
+
+    it('ships an example handoff that models the sub-segment shape', async () => {
+        const example = JSON.parse(
+            await readTextResource(client, PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI),
+        ) as PatchwalkHandoffPayload;
+        const firstStep = example.walkthrough[0];
+        ok(firstStep, 'the example should have at least one step');
+        ok(
+            Array.isArray(firstStep.segments) && firstStep.segments.length > 0,
+            'the example step should include a segments array agents can copy',
         );
     });
 
@@ -398,7 +600,7 @@ describe('patchwalk mcp server', () => {
         strictEqual(playResult.isError ?? false, false);
         strictEqual(parentWorker.executedPayloads.length, 0);
         strictEqual(exactWorker.executedPayloads.length, 1);
-        strictEqual(structuredContent?.status, 'completed');
+        strictEqual(structuredContent?.status, 'launched');
         strictEqual(structuredContent?.workerId, exactWorker.workerId);
         strictEqual(structuredContent?.matchedRoot, '/tmp/patchwalk-project');
     });
@@ -469,7 +671,7 @@ describe('patchwalk mcp server', () => {
         match(content[0]?.text ?? '', /No live Patchwalk window matched/);
     });
 
-    it('rejects a second playback while one handoff is active and allows stop', async () => {
+    it('launches, then rejects a second walk while one is active, and allows stop', async () => {
         const worker = new FakePatchwalkWorker(
             daemonClient,
             ['/tmp/patchwalk-project'],
@@ -481,11 +683,13 @@ describe('patchwalk mcp server', () => {
         workers.push(worker);
         await worker.start();
 
-        const firstPlayPromise = client.callTool({
+        // launch+ack: patchwalk.play returns immediately even though the worker holds the walk open.
+        const firstPlayResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
             arguments: createPayload('/tmp/patchwalk-project'),
         });
-
+        strictEqual(firstPlayResult.isError ?? false, false);
+        strictEqual((firstPlayResult.structuredContent as { status?: string })?.status, 'launched');
         await worker.startedExecution.promise;
 
         const secondPlayResult = await client.callTool({
@@ -513,13 +717,70 @@ describe('patchwalk mcp server', () => {
         strictEqual(stopContent?.status, 'stopped');
         strictEqual(stopContent?.workerId, worker.workerId);
 
-        const firstPlayResult = await firstPlayPromise;
-        strictEqual(firstPlayResult.isError, true);
-
         const statusResource = JSON.parse(
             await readTextResource(client, PATCHWALK_STATUS_RESOURCE_URI),
         ) as PatchwalkStatusResource;
         strictEqual(statusResource.activeHandoff, null);
+    });
+
+    it('broadcasts walk ownership (with the matched root as reveal path) and clears it on stop', async () => {
+        // The playing window's workspace root is a PARENT of the walk basePath, so the reveal path
+        // must be the matched ROOT, not the deeper basePath — a stricter assertion than exact match.
+        const playing = new FakePatchwalkWorker(
+            daemonClient,
+            ['/tmp/owner-root'],
+            'test-extension',
+            { holdExecutionUntilStopped: true },
+        );
+        const bystander = new FakePatchwalkWorker(daemonClient, ['/tmp/other-root']);
+        workers.push(playing, bystander);
+        await playing.start();
+        await bystander.start();
+
+        const playResult = await client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: createPayload('/tmp/owner-root/service/deep'),
+        });
+        strictEqual((playResult.structuredContent as { status?: string })?.status, 'launched');
+        await playing.startedExecution.promise;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        const latest = bystander.ownerMessages.at(-1);
+        ok(latest, 'the bystander should have received a walk.owner broadcast');
+        strictEqual(latest.active, true);
+        strictEqual(latest.ownerWorkerId, playing.workerId);
+        // Distinguishes selectedMatchedRoot from the basePath fallback.
+        strictEqual(latest.revealPath, '/tmp/owner-root');
+
+        await client.callTool({ name: PATCHWALK_STOP_TOOL_NAME, arguments: {} });
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        const afterStop = bystander.ownerMessages.at(-1);
+        strictEqual(afterStop?.active, false);
+    });
+
+    it('clears walk ownership everywhere when a walk completes naturally', async () => {
+        // No holdExecutionUntilStopped → the worker starts then immediately completes, exercising the
+        // handlePlaybackCompleted -> clearActiveDispatch -> broadcast(active:false) path.
+        const playing = new FakePatchwalkWorker(daemonClient, ['/tmp/complete-root']);
+        const bystander = new FakePatchwalkWorker(daemonClient, ['/tmp/other-root']);
+        workers.push(playing, bystander);
+        await playing.start();
+        await bystander.start();
+
+        await client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: createPayload('/tmp/complete-root'),
+        });
+        await new Promise((resolve) => setTimeout(resolve, 80));
+
+        // The walk started and finished; the bystander's final view is "nobody is playing".
+        const active = bystander.ownerMessages.filter((message) => message.active);
+        ok(active.length > 0, 'ownership should have been announced while playing');
+        strictEqual(
+            bystander.ownerMessages.at(-1)?.active,
+            false,
+            'ownership should be cleared after natural completion',
+        );
     });
 
     it('returns an idle stop result when no handoff is active', async () => {
@@ -550,11 +811,11 @@ describe('patchwalk mcp server', () => {
         workers.push(worker);
         await worker.start();
 
-        const firstPlayPromise = client.callTool({
+        const firstPlayResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
             arguments: createPayload('/tmp/patchwalk-project'),
         });
-
+        strictEqual((firstPlayResult.structuredContent as { status?: string })?.status, 'launched');
         await worker.startedExecution.promise;
 
         const stopResult = await client.callTool({
@@ -569,9 +830,6 @@ describe('patchwalk mcp server', () => {
 
         strictEqual(stopResult.isError ?? false, false);
         strictEqual(stopContent?.status, 'stopped');
-
-        const firstPlayResult = await firstPlayPromise;
-        strictEqual(firstPlayResult.isError, true);
 
         const statusResource = JSON.parse(
             await readTextResource(client, PATCHWALK_STATUS_RESOURCE_URI),
@@ -597,7 +855,10 @@ describe('patchwalk mcp server', () => {
             client,
             PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
         );
-        match(authoringGuide, /semantic patch explanation/);
+        // The guide is voice-first: it must push spoken, what+why narration, not diff paraphrase.
+        match(authoringGuide, /SPOKEN ALOUD/);
+        match(authoringGuide, /the what and the WHY/i);
+        match(authoringGuide, /never the diff/i);
         match(authoringGuide, /Risk analysis/);
         match(authoringGuide, /Blast radius/);
 
@@ -613,7 +874,103 @@ describe('patchwalk mcp server', () => {
             throw new Error('Expected text compose prompt content.');
         }
 
-        match(composePrompt.messages[0].content.text, /behavior change/);
+        match(composePrompt.messages[0].content.text, /SPOKEN ALOUD/);
         match(composePrompt.messages[0].content.text, /risk signals/);
+
+        const onboardingPrompt = await client.getPrompt({
+            name: PATCHWALK_COMPOSE_ONBOARDING_PROMPT_NAME,
+            arguments: { codebasePath: '/tmp/project' },
+        });
+        if (onboardingPrompt.messages[0]?.content.type !== 'text') {
+            throw new Error('Expected text onboarding prompt content.');
+        }
+        match(onboardingPrompt.messages[0].content.text, /ONBOARDS a newcomer/);
+        match(onboardingPrompt.messages[0].content.text, /\/tmp\/project/);
+    });
+
+    it('launch+ack returns before the walk completes', async () => {
+        const worker = new FakePatchwalkWorker(
+            daemonClient,
+            ['/tmp/held-project'],
+            'test-extension',
+            { holdExecutionUntilStopped: true },
+        );
+        workers.push(worker);
+        await worker.start();
+
+        const playResult = await client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: createPayload('/tmp/held-project'),
+        });
+        const content = playResult.structuredContent as
+            | { status?: string; walkId?: string; workerId?: string; steps?: number }
+            | undefined;
+
+        strictEqual(playResult.isError ?? false, false);
+        strictEqual(content?.status, 'launched');
+        strictEqual(content?.workerId, worker.workerId);
+        ok((content?.walkId?.length ?? 0) > 0, 'launched result should carry a walkId');
+        strictEqual(content?.steps, 2); // one summary segment + one walkthrough step
+
+        await worker.startedExecution.promise;
+        const statusResource = JSON.parse(
+            await readTextResource(client, PATCHWALK_STATUS_RESOURCE_URI),
+        ) as PatchwalkStatusResource;
+        ok(statusResource.activeHandoff, 'the walk should still be active after launch');
+    });
+
+    it('fails over to the next window when the top candidate never becomes ready', async function () {
+        this.timeout(10_000);
+        const wedged = new FakePatchwalkWorker(
+            daemonClient,
+            ['/tmp/failover-root'],
+            'test-extension',
+            { neverReady: true },
+        );
+        const healthy = new FakePatchwalkWorker(
+            daemonClient,
+            ['/tmp/failover-root'],
+            'test-extension',
+        );
+        workers.push(wedged, healthy);
+        await wedged.start(); // earliest registration → ranked first, but never acks
+        await healthy.start();
+
+        const playResult = await client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: createPayload('/tmp/failover-root/project'),
+        });
+        const content = playResult.structuredContent as
+            | { status?: string; workerId?: string }
+            | undefined;
+
+        strictEqual(playResult.isError ?? false, false);
+        strictEqual(content?.status, 'launched');
+        strictEqual(content?.workerId, healthy.workerId);
+        strictEqual(wedged.executedPayloads.length, 0);
+        strictEqual(healthy.executedPayloads.length, 1);
+    });
+
+    it('a single wedged window fails fast instead of hanging (P3 guard)', async function () {
+        this.timeout(10_000);
+        const wedged = new FakePatchwalkWorker(
+            daemonClient,
+            ['/tmp/zombie-root'],
+            'test-extension',
+            { neverReady: true },
+        );
+        workers.push(wedged);
+        await wedged.start();
+
+        const startedAt = Date.now();
+        const playResult = await client.callTool({
+            name: PATCHWALK_PLAY_TOOL_NAME,
+            arguments: createPayload('/tmp/zombie-root'),
+        });
+        const elapsedMs = Date.now() - startedAt;
+
+        strictEqual(playResult.isError, true);
+        strictEqual(wedged.executedPayloads.length, 0);
+        ok(elapsedMs < 8_000, `expected a fast failover, but it took ${elapsedMs}ms`);
     });
 });

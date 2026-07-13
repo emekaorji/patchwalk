@@ -1,199 +1,174 @@
 # Patchwalk
 
-Patchwalk replays AI code handoffs inside live editor windows.
+**Patchwalk speaks an AI's code changes back to you, inside your editor.**
 
-The extension now runs in two layers:
+AI agents now write most of the code, and it's easy to ship it without ever reading it. Patchwalk
+fixes that: right after an agent finishes a run, it launches a **walk** — a short, spoken
+walkthrough that plays inside your editor, highlighting each file and range while narrating **what
+changed and, more importantly, _why_**. It's the difference between a wall of diff text and a senior
+engineer explaining the change out loud.
 
-- a single local daemon that owns the MCP endpoint
-- one worker per VS Code/Cursor window that registers workspace roots and can play a handoff locally
+Patchwalk is **not** a code-review tool (it doesn't gate PRs or score risk). It _explains_ — for
+three jobs:
 
-The daemon is bundled inside the extension. Users install one extension. They do not install a separate MCP server.
+1. **Post-run handoff** — an agent finishes a change while you're elsewhere; Patchwalk walks you
+   through the reasoning when you come back.
+2. **Change review** — walk any change to confirm it matches the ask.
+3. **Codebase onboarding** — get a whole system explained start to finish, step by step.
 
-## Runtime model
+Voice is the point. A **sidebar transcript** is its companion, so the reasoning is still there to
+re-scan after the audio moves on.
 
-On the first Patchwalk activation after install:
+---
 
-1. the extension checks `GET /health` on the local daemon port
-2. if the daemon is down, the extension spawns the bundled Node daemon
-3. the window opens one persistent WebSocket connection to the daemon
-4. the worker registers its current workspace folder roots and playback state
-5. the worker sends heartbeat and workspace updates over that same socket
+## How it works
 
-If the daemon dies later, any live Patchwalk window will restart it and re-register.
+An external AI agent (Claude Code, Codex, …) can't call an MCP server that lives inside one editor
+window, and N windows can't share one port. So Patchwalk runs a **single local daemon** that owns
+the MCP endpoint and **routes** each walk to the right editor window over a private WebSocket.
 
-## Commands
+```
+  External AI agent ──HTTP (MCP)──▶  Patchwalk daemon (127.0.0.1:7357)
+   (Claude / Codex)  ◀──{launched}──   ├─ /mcp   Streamable-HTTP endpoint
+                                        └─ /workers/connect  WebSocket router
+                                                     │
+                          ┌──────────────────────────┼──────────────────────┐
+                       VS Code #1                 VS Code #2      …        VS Code #N
+                    (worker + sidebar + playback)
+```
 
-- `Patchwalk: Restart Daemon`
-- `Patchwalk: Show Daemon Status`
-- `Patchwalk: Stop Daemon`
-- `Patchwalk: Play Handoff From Clipboard`
+A walk carries an absolute `basePath`. The daemon routes it to the window whose workspace root
+**equals** that path, else the **deepest parent**, else the **earliest-registered** window. Exactly
+**one walk plays machine-wide at a time** (it's a single voice).
 
-`Stop Daemon` is a debug command. Once stopped, the current worker pauses automatic daemon recovery until you restart the daemon or reload the window.
+`patchwalk.play` returns as soon as the walk is **launched** — it never blocks while narration plays.
+You drive the running walk from the Patchwalk sidebar (pause, next, stop, replay, jump).
 
-## Settings
+---
 
-- `patchwalk.daemonPort` (default: `7357`)
+## Install & set up
 
-## MCP endpoint
+1. Install the Patchwalk extension in VS Code or Cursor. On first activation it starts the bundled
+   daemon automatically — you do **not** install a separate MCP server.
+2. Point your agent at the MCP endpoint: `http://127.0.0.1:7357/mcp` (Streamable HTTP).
+   For example, add it to your Claude Code / Codex MCP config, then tell the agent to call
+   `patchwalk.play` after each change.
+3. Open the project you're working in as a workspace folder so the daemon can route walks to it.
 
-- URL: `http://127.0.0.1:<patchwalk.daemonPort>/mcp`
-- Health check: `GET /health`
-- Transport: stateful Streamable HTTP via `@modelcontextprotocol/sdk`
-- MCP methods handled on the endpoint: `POST`, `GET`, `DELETE`
+---
 
-The daemon also exposes one private worker socket used only by extension windows:
+## MCP surface
 
-- `ws://127.0.0.1:<patchwalk.daemonPort>/workers/connect`
+**Tools**
 
-## Routing contract
+- `patchwalk.play(walk)` — launch a spoken walk in the matching window. Returns immediately:
+  `{ status: 'launched', walkId, handoffId, workerId, matchedRoot, steps }`. Rejected if a walk is
+  already active anywhere on the machine.
+- `patchwalk.stop()` — stop the active walk (interrupts narration immediately).
+- `patchwalk.status()` — the active walk's window, step index/total, and state.
 
-Every handoff must include a root-level `basePath`.
+**Prompts** (draft a walk with your agent)
 
-- `basePath` must be an absolute filesystem path.
-- The daemon compares `basePath` against the registered workspace roots of every live worker.
-- The daemon routes directly to one worker using:
-  - exact match first
-  - otherwise longest parent-path match
-  - otherwise earliest live registration
-- The daemon sends a lightweight `playback.prepare` message to the best candidate first.
-- If that worker is stale or unavailable, the daemon falls through to the next ranked worker.
-- Only the selected worker receives the actual `playback.execute` command.
+- `patchwalk.compose-handoff` — a full walk for a change.
+- `patchwalk.expand-walkthrough` — turn a summary + file list into walk steps.
+- `patchwalk.compose-onboarding` — a whole-codebase onboarding walk.
 
-## Active handoff contract
+**Resources**
 
-- Patchwalk allows exactly one active narration across the whole machine at a time.
-- If any worker is already playing or stopping a handoff, new `patchwalk.play` requests are rejected immediately.
-- Clipboard playback uses the same daemon path and is subject to the same single-active-handoff rule.
-- Use `patchwalk.stop` to stop the currently active narration globally.
+- `patchwalk://server/status` · `patchwalk://server/operator-manual`
+- `patchwalk://handoff/example` · `patchwalk://handoff/authoring-guide`
 
-## Minimal payload
+> Read `patchwalk://handoff/authoring-guide` before generating walks. Because the narration is
+> **spoken**, it must be written to be heard: conversational sentences about the **what and the
+> WHY** — never a diff narration, never code or line numbers read aloud.
+
+### Walk payload
 
 ```json
 {
   "specVersion": "1.0.0",
   "handoffId": "8d8f64f2-6f2c-4f91-a7ba-3af2f0ef8d9a",
   "createdAt": "2026-03-05T09:10:00Z",
-  "basePath": "/Users/mac/Vault/the-60/my-project",
-  "producer": { "agent": "codex", "agentVersion": "1.0", "model": "gpt-5" },
-  "summary": "Added refresh flow.",
+  "basePath": "/Users/you/project",
+  "producer": { "agent": "codex", "model": "gpt-5" },
+  "summary": "Fixes a race in cache eviction and doubles the retry backoff.",
   "walkthrough": [
     {
       "id": "step-1",
-      "title": "Refresh handler",
-      "narration": "This file adds refresh token validation, rotation, and response shaping.",
-      "path": "src/auth/refresh.ts",
-      "type": "symbol",
-      "symbol": "handleRefresh",
+      "title": "Eviction lock ordering",
+      "narration": "The lock now wraps the lookup, so two requests can't evict the same entry at once — that was the source of the intermittent nil-pointer panic.",
+      "path": "src/cache/evict.ts",
       "range": { "startLine": 24, "endLine": 92 }
     }
   ]
 }
 ```
 
-Relative step paths resolve from `basePath`, not from the currently focused editor tab.
+Relative step `path`s resolve from `basePath`, not the focused tab.
 
-## Capabilities
+---
 
-Tools:
+## The sidebar (activity bar)
 
-- `patchwalk.play`
-- `patchwalk.stop`
+Open the Patchwalk view in the activity bar to monitor and control a walk:
 
-Resources:
+- **Now Playing** — summary, current step, `i / N`, and transport controls: ⏮ ⏯ ⏹ ⏭ ↻.
+- **Walk transcript** — every step's narration; the current one is highlighted; **click a step to
+  jump** to its file and range. The reasoning persists here after the voice moves on.
+- **Voices** — pick the narration voice, or download a local neural voice (below).
 
-- `patchwalk://server/status`
-- `patchwalk://server/operator-manual`
-- `patchwalk://handoff/example`
-- `patchwalk://handoff/authoring-guide`
+---
 
-Prompts:
+## Voice
 
-- `patchwalk.compose-handoff`
-- `patchwalk.expand-walkthrough`
+By default Patchwalk uses your OS voice — macOS `say`, Windows SAPI, Linux `espeak-ng` — with no
+setup, offline, and private.
 
-## Manual testing
+For a more natural, human-sounding walk, download a **local neural voice** (e.g. Kokoro) from the
+**Voices** panel. It runs fully offline via a bundled runtime, with no API keys. If a neural voice
+can't run on your machine, Patchwalk falls back to the system voice and tells you honestly rather
+than playing silence.
 
-Run the sample client:
+---
 
-```bash
-pnpm play:sample
-```
+## Commands & settings
 
-If you changed the daemon port:
+**Commands**
 
-```bash
-PATCHWALK_DAEMON_PORT=7357 pnpm play:sample
-```
+- `Patchwalk: Restart Daemon` · `Patchwalk: Show Daemon Status` · `Patchwalk: Stop Daemon`
+- `Patchwalk: Play Walk From Clipboard`
 
-Expected result:
+**Settings**
 
-1. the client connects to the daemon MCP endpoint
-2. the daemon status resource shows registered workers
-3. the handoff is routed to the best matching live window
-4. that window opens files, highlights ranges, and narrates the walkthrough
-5. if another handoff is already active, the daemon rejects the request until the active one completes or is stopped
+- `patchwalk.daemonPort` (default `7357`) — the local daemon port.
+- `patchwalk.voice` (default `"system"`) — active voice; set to a downloaded neural voice id from
+  the Voices panel.
 
-Before generating non-trivial payloads, read `patchwalk://handoff/authoring-guide`. It tells MCP clients to write semantic engineer-facing explanations with intent, risk, blast radius, behavior changes, tests, and architecture, while filtering out formatting-only noise.
-
-## Recovery steps
-
-### Daemon is down
-
-Symptom:
-
-- `GET /health` fails
-- MCP clients cannot connect
-
-Recovery:
-
-1. open any VS Code/Cursor window with Patchwalk installed
-2. wait for activation or run `Patchwalk: Restart Daemon`
-3. retry the MCP call
-
-Expected outcome:
-
-- `GET /health` returns `ok: true`
-- `patchwalk://server/status` shows at least one registered worker
-
-### Handoff does not play anywhere
-
-Symptom:
-
-- MCP tool call returns an error saying no live Patchwalk window matched `basePath`
-
-Recovery:
-
-1. verify `basePath` is absolute
-2. verify a Patchwalk-enabled window has the exact path open as a workspace root, or a parent of it open as a workspace root
-3. run `Patchwalk: Show Daemon Status` and inspect the registered worker roots
-4. resend the handoff
-
-### New handoff is rejected as already active
-
-Symptom:
-
-- MCP tool call returns an error saying another Patchwalk handoff is already active
-
-Recovery:
-
-1. run the MCP tool `patchwalk.stop`, or wait for the current narration to complete
-2. if you think nothing is active, run `Patchwalk: Show Daemon Status`
-3. inspect `activeHandoff` and each worker `playbackState`
-4. if the daemon state is stale, reload the worker window that still reports playback
-
-### Wrong window wins routing
-
-Recovery:
-
-1. prefer sending the most specific `basePath`
-2. if two windows both open parents of the same path, open the exact project root in the intended window
-3. if the tie is still identical, reload the intended window first so it becomes the earliest live registration
+---
 
 ## Development
 
 ```bash
 pnpm install
-pnpm esbuild:base
+pnpm esbuild:base       # build the extension + daemon bundles
+pnpm test               # build, then run the full suite in a real VS Code host
 ```
 
-Run the extension via `F5` in VS Code.
+Run the extension with `F5` in VS Code. Smoke-test the MCP surface against a running daemon (and an
+open Patchwalk window on the given path):
+
+```bash
+pnpm play:sample /abs/path/to/your/workspace
+```
+
+---
+
+## Troubleshooting
+
+- **`patchwalk.play` says no window matched `basePath`.** Open the exact project root (or a parent)
+  as a workspace folder in a Patchwalk-enabled window, then retry. `patchwalk.status` and
+  `Patchwalk: Show Daemon Status` show the registered windows.
+- **A walk is rejected as already active.** Only one walk plays at a time — call `patchwalk.stop`
+  (or use the sidebar) and retry.
+- **The daemon seems down.** Any live Patchwalk window restarts it; run `Patchwalk: Restart Daemon`
+  and retry. `GET http://127.0.0.1:7357/health` should return `{ "ok": true }`.

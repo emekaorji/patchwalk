@@ -76,7 +76,11 @@ const main = async (): Promise<void> => {
     });
 };
 
-main().catch((error) => {
+main().catch(async (error) => {
+    // Route the failure to the file log too — the daemon is spawned with stdio ignored, so a
+    // console-only error would vanish and leave a dead daemon with no diagnostic trail (P7).
+    logger.error('Patchwalk daemon crashed during bootstrap.', error);
     console.error(error);
+    await logger.close();
     process.exitCode = 1;
 });

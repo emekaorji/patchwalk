@@ -8,8 +8,16 @@ import WebSocket from 'ws';
 import type {
     PatchwalkPlaybackExecuteMessage,
     PatchwalkPlaybackFailedMessage,
+    PatchwalkPlaybackNextMessage,
+    PatchwalkPlaybackPauseMessage,
     PatchwalkPlaybackPrepareMessage,
+    PatchwalkPlaybackPreviousMessage,
+    PatchwalkPlaybackProgressMessage,
+    PatchwalkPlaybackReadyMessage,
+    PatchwalkPlaybackResumeMessage,
+    PatchwalkPlaybackStartedMessage,
     PatchwalkPlaybackStopMessage,
+    PatchwalkWalkOwnerMessage,
     PatchwalkWorkerHeartbeatMessage,
     PatchwalkWorkerRegisterMessage,
     PatchwalkWorkerToDaemonMessage,
@@ -23,9 +31,22 @@ import {
 } from '../lib/controlProtocol';
 import { normalizeAbsolutePath } from '../lib/pathUtils';
 import { matchBasePathToWorkspaceRoots } from '../lib/routing';
-import type { PatchwalkHandoffPayload } from '../lib/schema';
+import type { PatchwalkHandoffPayload, PatchwalkNarrationStyle } from '../lib/schema';
+import { PATCHWALK_DEFAULT_NARRATION_STYLE } from '../lib/schema';
 import { PatchwalkDaemonClient } from './daemonClient';
-import type { PatchwalkPlaybackRunner } from './playback';
+import type { PatchwalkPlaybackRun, PatchwalkPlaybackRunner } from './playback';
+import { revealWindowForPath } from './revealWindow';
+import type { WalkMonitorDaemonStatus } from './sidebar/walkMonitorModel';
+import type { DaemonStatusController } from './sidebar/walkMonitorView';
+import type { RemoteWalkSource, RemoteWalkState } from './statusSignal';
+import type { WalkProgress } from './walkSequencer';
+
+interface ActivePlaybackHandle {
+    run: PatchwalkPlaybackRun;
+    dispatchId: string;
+    handoffId: string;
+    progressSubscription: { dispose(): void };
+}
 
 interface PatchwalkWorkerControllerOptions {
     context: vscode.ExtensionContext;
@@ -38,10 +59,14 @@ interface PatchwalkWorkerControllerOptions {
  * The worker controller is the extension-side control plane. It keeps the daemon alive, maintains
  * one persistent worker socket, and translates daemon messages into local playback actions.
  */
-export class PatchwalkWorkerController implements vscode.Disposable {
+export class PatchwalkWorkerController
+    implements vscode.Disposable, DaemonStatusController, RemoteWalkSource
+{
     private readonly workerId = randomUUID();
     private readonly daemonClient: PatchwalkDaemonClient;
     private readonly disposables: vscode.Disposable[] = [];
+    private readonly statusChangeEmitter = new vscode.EventEmitter<void>();
+    private readonly remoteWalkChangeEmitter = new vscode.EventEmitter<void>();
     private heartbeatTimer: NodeJS.Timeout | undefined;
     private reconnectTimer: NodeJS.Timeout | undefined;
     private socket: WebSocket | undefined;
@@ -50,6 +75,9 @@ export class PatchwalkWorkerController implements vscode.Disposable {
     private stopping = false;
     private daemonManagementEnabled = true;
     private heartbeatIntervalMs = PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS;
+    private activePlayback: ActivePlaybackHandle | undefined;
+    /** The active walk as seen from THIS window — only set when it plays in a DIFFERENT window. */
+    private remoteWalk: RemoteWalkState = { active: false };
 
     public constructor(private readonly options: PatchwalkWorkerControllerOptions) {
         this.daemonClient = new PatchwalkDaemonClient({
@@ -64,11 +92,71 @@ export class PatchwalkWorkerController implements vscode.Disposable {
         });
     }
 
+    public onDidChange(listener: () => void): vscode.Disposable {
+        return this.statusChangeEmitter.event(listener);
+    }
+
+    public onDidChangeRemoteWalk(listener: () => void): vscode.Disposable {
+        return this.remoteWalkChangeEmitter.event(listener);
+    }
+
+    /** The active walk as seen from this window (active only when it plays elsewhere). */
+    public getRemoteWalk(): RemoteWalkState {
+        return this.remoteWalk;
+    }
+
+    /** Raise the window currently playing a walk (best-effort; there is no window-focus API). */
+    public async revealPlayingWindow(): Promise<void> {
+        if (!this.remoteWalk.active || !this.remoteWalk.revealPath) {
+            await vscode.window.showInformationMessage(
+                'No Patchwalk walk is playing in another window.',
+            );
+            return;
+        }
+        const revealed = revealWindowForPath(this.remoteWalk.revealPath, (message) =>
+            this.options.outputChannel.appendLine(message),
+        );
+        if (!revealed) {
+            await vscode.window.showInformationMessage(
+                `Patchwalk is playing in the window for ${this.remoteWalk.revealPath}.`,
+            );
+        }
+    }
+
+    /** Daemon/connection summary for the sidebar's Daemon status line. */
+    public async getStatus(): Promise<WalkMonitorDaemonStatus> {
+        const connected = this.isSocketOpen();
+        const workspaceRoots = await this.collectWorkspaceRoots();
+        // The daemon pushes ownership via `walk.owner`, so this stays live without a status round-trip.
+        const activeWalkElsewhere = this.remoteWalk.active;
+
+        const detail = connected
+            ? workspaceRoots.length > 0
+                ? `Connected · ${workspaceRoots.length} workspace root${
+                      workspaceRoots.length === 1 ? '' : 's'
+                  }`
+                : 'Connected'
+            : this.daemonManagementEnabled
+              ? 'Reconnecting…'
+              : 'Daemon stopped';
+        return { connected, detail, activeWalkElsewhere };
+    }
+
     public async start(): Promise<void> {
         this.disposables.push(
             vscode.workspace.onDidChangeWorkspaceFolders(() => {
                 this.refreshRegistration().catch((error: unknown) => {
                     this.reportError('Patchwalk workspace registration refresh failed', error);
+                });
+            }),
+            // The narration style rewrites the daemon's instructions to authoring agents, so the
+            // daemon must be told the moment it changes — not on the next reload.
+            vscode.workspace.onDidChangeConfiguration((event) => {
+                if (!event.affectsConfiguration('patchwalk.narrationStyle')) {
+                    return;
+                }
+                this.refreshRegistration().catch((error: unknown) => {
+                    this.reportError('Patchwalk narration-style refresh failed', error);
                 });
             }),
         );
@@ -130,6 +218,8 @@ export class PatchwalkWorkerController implements vscode.Disposable {
         }
         this.clearReconnectTimer();
         this.closeSocket();
+        this.statusChangeEmitter.dispose();
+        this.remoteWalkChangeEmitter.dispose();
 
         for (const disposable of this.disposables) {
             disposable.dispose();
@@ -160,6 +250,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
         await this.daemonClient.ensureServerRunning();
         await this.connectSocket();
         this.startHeartbeatLoop();
+        this.statusChangeEmitter.fire();
     }
 
     private async connectSocket(): Promise<void> {
@@ -200,6 +291,12 @@ export class PatchwalkWorkerController implements vscode.Disposable {
             if (this.socket === socket) {
                 this.socket = undefined;
             }
+            // We can no longer trust who owns the walk until the daemon re-informs us on reconnect.
+            if (this.remoteWalk.active) {
+                this.remoteWalk = { active: false };
+                this.remoteWalkChangeEmitter.fire();
+            }
+            this.statusChangeEmitter.fire();
 
             if (!this.stopping && this.daemonManagementEnabled) {
                 this.scheduleReconnect();
@@ -313,10 +410,46 @@ export class PatchwalkWorkerController implements vscode.Disposable {
             case 'playback.stop':
                 await this.handleStopMessage(message);
                 return;
+            case 'playback.pause':
+                this.handlePauseMessage(message);
+                return;
+            case 'playback.resume':
+                this.handleResumeMessage(message);
+                return;
+            case 'playback.next':
+                this.handleNextMessage(message);
+                return;
+            case 'playback.previous':
+                this.handlePreviousMessage(message);
+                return;
             case 'worker.reconcile':
                 await this.refreshRegistration();
                 return;
+            case 'walk.owner':
+                this.handleWalkOwnerMessage(message);
+                return;
         }
+    }
+
+    private handleWalkOwnerMessage(message: PatchwalkWalkOwnerMessage): void {
+        // "Remote" means the walk is playing in a DIFFERENT window; the local window shows its own
+        // rich badge from the playback runner, so we suppress the "elsewhere" signal for ourselves.
+        const isLocal = message.ownerWorkerId === this.workerId;
+        const next: RemoteWalkState =
+            message.active && !isLocal
+                ? { active: true, revealPath: message.revealPath }
+                : { active: false };
+
+        if (
+            next.active === this.remoteWalk.active &&
+            next.revealPath === this.remoteWalk.revealPath
+        ) {
+            return;
+        }
+        this.remoteWalk = next;
+        this.remoteWalkChangeEmitter.fire();
+        // The sidebar's Daemon line also reflects "a walk is playing in another window".
+        this.statusChangeEmitter.fire();
     }
 
     private async handlePrepareMessage(message: PatchwalkPlaybackPrepareMessage): Promise<void> {
@@ -324,51 +457,154 @@ export class PatchwalkWorkerController implements vscode.Disposable {
         const match = matchBasePathToWorkspaceRoots(message.basePath, workspaceRoots);
         const playbackState = this.options.playbackRunner.getStateSnapshot();
 
-        if (!match || playbackState.state !== 'idle') {
+        // Positive ack: the daemon proceeds only when it receives this, so a wedged or busy window
+        // can never silently swallow a walk (P3). Availability requires an idle runner and a match.
+        if (match && playbackState.state === 'idle' && !this.activePlayback) {
             await this.sendMessage(
-                this.createPlaybackFailedMessage(
-                    message.dispatchId,
-                    message.handoffId,
-                    'prepare',
-                    'unavailable',
-                    'Worker can no longer serve the requested basePath.',
-                ),
+                this.createPlaybackReadyMessage(message.dispatchId, message.handoffId),
             );
+            return;
         }
+
+        await this.sendMessage(
+            this.createPlaybackFailedMessage(
+                message.dispatchId,
+                message.handoffId,
+                'prepare',
+                'unavailable',
+                'Worker can no longer serve the requested basePath.',
+            ),
+        );
     }
 
     private async handleExecuteMessage(message: PatchwalkPlaybackExecuteMessage): Promise<void> {
-        try {
-            await this.options.playbackRunner.play(message.payload);
-            await this.sendMessage({
-                type: 'playback.completed',
-                messageId: randomUUID(),
-                workerId: this.workerId,
-                sentAt: new Date().toISOString(),
-                dispatchId: message.dispatchId,
-                handoffId: message.payload.handoffId,
-                stepsPlayed: message.payload.walkthrough.length,
-            });
-        } catch (error) {
-            if (error instanceof Error && error.name === 'PatchwalkPlaybackStoppedError') {
-                return;
-            }
+        const dispatchId = message.dispatchId;
+        const handoffId = message.payload.handoffId;
 
+        if (this.activePlayback) {
+            await this.sendMessage(
+                this.createPlaybackFailedMessage(
+                    dispatchId,
+                    handoffId,
+                    'execute',
+                    'execution_failed',
+                    'Worker already has an active walk.',
+                ),
+            );
+            return;
+        }
+
+        let run: PatchwalkPlaybackRun;
+        try {
+            // NOTE: play() returns a control handle synchronously and runs the walk in the
+            // background. The message queue is therefore NOT held for the walk's duration, which
+            // is what lets stop/pause/next messages interrupt it (P1).
+            run = this.options.playbackRunner.play(message.payload);
+        } catch (error) {
             const messageText = error instanceof Error ? error.message : String(error);
             await this.sendMessage(
                 this.createPlaybackFailedMessage(
-                    message.dispatchId,
-                    message.payload.handoffId,
+                    dispatchId,
+                    handoffId,
                     'execute',
                     'execution_failed',
                     messageText,
                 ),
             );
+            return;
         }
+
+        const stepsPlayed = message.payload.walkthrough.length;
+        const progressSubscription = run.onDidProgress((progress) => {
+            this.emitToDaemon(this.createProgressMessage(dispatchId, handoffId, progress));
+        });
+        this.activePlayback = { run, dispatchId, handoffId, progressSubscription };
+
+        // Launch ack (P2): the daemon resolves patchwalk.play on THIS, never on completion.
+        await this.sendMessage(
+            this.createPlaybackStartedMessage(dispatchId, handoffId, run.getSnapshot().stepCount),
+        );
+
+        run.completion
+            .then(() => {
+                this.emitToDaemon({
+                    type: 'playback.completed',
+                    messageId: randomUUID(),
+                    workerId: this.workerId,
+                    sentAt: new Date().toISOString(),
+                    dispatchId,
+                    handoffId,
+                    stepsPlayed,
+                });
+            })
+            .catch((error: unknown) => {
+                // The run's completion is the single source of the terminal message, so a walk
+                // stopped from the sidebar (locally) still notifies the daemon and releases the
+                // machine-wide lock — not only walks stopped via the daemon's stop tool.
+                if (error instanceof Error && error.name === 'PatchwalkPlaybackStoppedError') {
+                    this.emitToDaemon({
+                        type: 'playback.stopped',
+                        messageId: randomUUID(),
+                        workerId: this.workerId,
+                        sentAt: new Date().toISOString(),
+                        dispatchId,
+                        handoffId,
+                    });
+                    return;
+                }
+                const messageText = error instanceof Error ? error.message : String(error);
+                this.emitToDaemon(
+                    this.createPlaybackFailedMessage(
+                        dispatchId,
+                        handoffId,
+                        'execute',
+                        'execution_failed',
+                        messageText,
+                    ),
+                );
+            })
+            .finally(() => {
+                progressSubscription.dispose();
+                if (this.activePlayback?.run === run) {
+                    this.activePlayback = undefined;
+                }
+            });
+    }
+
+    private handlePauseMessage(message: PatchwalkPlaybackPauseMessage): void {
+        if (this.activePlayback?.dispatchId === message.dispatchId) {
+            this.activePlayback.run.pause();
+        }
+    }
+
+    private handleResumeMessage(message: PatchwalkPlaybackResumeMessage): void {
+        if (this.activePlayback?.dispatchId === message.dispatchId) {
+            this.activePlayback.run.resume();
+        }
+    }
+
+    private handleNextMessage(message: PatchwalkPlaybackNextMessage): void {
+        if (this.activePlayback?.dispatchId === message.dispatchId) {
+            this.activePlayback.run.next();
+        }
+    }
+
+    private handlePreviousMessage(message: PatchwalkPlaybackPreviousMessage): void {
+        if (this.activePlayback?.dispatchId === message.dispatchId) {
+            this.activePlayback.run.previous();
+        }
+    }
+
+    private emitToDaemon(message: PatchwalkWorkerToDaemonMessage): void {
+        this.sendMessage(message).catch((error: unknown) => {
+            this.reportError('Patchwalk worker failed to send message', error);
+        });
     }
 
     private async handleStopMessage(message: PatchwalkPlaybackStopMessage): Promise<void> {
         try {
+            // The run's completion handler emits `playback.stopped`; here we only need to trigger
+            // the stop and report when there was nothing to stop.
             const stopped = await this.options.playbackRunner.stopActivePlayback();
             if (!stopped) {
                 await this.sendMessage(
@@ -377,20 +613,10 @@ export class PatchwalkWorkerController implements vscode.Disposable {
                         message.handoffId,
                         'stop',
                         'unavailable',
-                        'No active Patchwalk playback was running in this worker.',
+                        'No active Patchwalk walk was running in this worker.',
                     ),
                 );
-                return;
             }
-
-            await this.sendMessage({
-                type: 'playback.stopped',
-                messageId: randomUUID(),
-                workerId: this.workerId,
-                sentAt: new Date().toISOString(),
-                dispatchId: message.dispatchId,
-                handoffId: message.handoffId,
-            });
         } catch (error) {
             const messageText = error instanceof Error ? error.message : String(error);
             await this.sendMessage(
@@ -416,6 +642,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
             workspaceRoots: [],
             lastSeenAt: new Date().toISOString(),
             apiVersion: PATCHWALK_WORKER_API_VERSION,
+            narrationStyle: this.readNarrationStyle(),
             ...this.createWorkerRuntimeState(),
         };
     }
@@ -463,6 +690,55 @@ export class PatchwalkWorkerController implements vscode.Disposable {
         };
     }
 
+    private createPlaybackReadyMessage(
+        dispatchId: string,
+        handoffId: string,
+    ): PatchwalkPlaybackReadyMessage {
+        return {
+            type: 'playback.ready',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            dispatchId,
+            handoffId,
+        };
+    }
+
+    private createPlaybackStartedMessage(
+        dispatchId: string,
+        handoffId: string,
+        stepCount: number,
+    ): PatchwalkPlaybackStartedMessage {
+        return {
+            type: 'playback.started',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            dispatchId,
+            handoffId,
+            stepCount,
+        };
+    }
+
+    private createProgressMessage(
+        dispatchId: string,
+        handoffId: string,
+        progress: WalkProgress,
+    ): PatchwalkPlaybackProgressMessage {
+        return {
+            type: 'playback.progress',
+            messageId: randomUUID(),
+            workerId: this.workerId,
+            sentAt: new Date().toISOString(),
+            dispatchId,
+            handoffId,
+            stepIndex: progress.stepIndex,
+            stepCount: progress.stepCount,
+            stepId: progress.stepId,
+            playbackState: progress.state,
+        };
+    }
+
     private createWorkerRuntimeState() {
         const playbackState = this.options.playbackRunner.getStateSnapshot();
         return {
@@ -471,6 +747,18 @@ export class PatchwalkWorkerController implements vscode.Disposable {
                 ? { activeHandoffId: playbackState.activeHandoffId }
                 : {}),
         };
+    }
+
+    /**
+     * The narration style the daemon should hand to authoring agents. The setting is
+     * application-scoped (global only), so every window reports the same value and the daemon can
+     * trust whichever report arrives last.
+     */
+    private readNarrationStyle(): PatchwalkNarrationStyle {
+        const configured = vscode.workspace
+            .getConfiguration('patchwalk')
+            .get<string>('narrationStyle', PATCHWALK_DEFAULT_NARRATION_STYLE);
+        return configured === 'grounded' ? 'grounded' : 'terse';
     }
 
     private async collectWorkspaceRoots(): Promise<string[]> {
@@ -497,6 +785,7 @@ export class PatchwalkWorkerController implements vscode.Disposable {
                 ...message,
                 workspaceRoots: await this.collectWorkspaceRoots(),
                 lastSeenAt: new Date().toISOString(),
+                narrationStyle: this.readNarrationStyle(),
                 ...this.createWorkerRuntimeState(),
             };
         } else if (message.type === 'worker.heartbeat') {

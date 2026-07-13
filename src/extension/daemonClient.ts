@@ -75,6 +75,15 @@ const getPortListenerArgs = (port: number): string[] => {
     return ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'];
 };
 
+/**
+ * Safety gate for reclaiming the daemon port (P7): only a process that identifies itself as a
+ * Patchwalk daemon via `GET /health` may be terminated. A stranger's process on the port is left
+ * alone. Pure and exported so the rule is unit-tested.
+ */
+export const isReclaimablePatchwalkDaemon = (serverKind?: string): boolean => {
+    return serverKind === 'patchwalk-daemon';
+};
+
 export class PatchwalkDaemonClient {
     private startupPromise: Promise<void> | undefined;
 
@@ -220,6 +229,10 @@ export class PatchwalkDaemonClient {
                 env: {
                     ...process.env,
                     PATCHWALK_DAEMON_PORT: String(this.options.port),
+                    // In a desktop extension host `process.execPath` is the editor's Electron
+                    // binary; this makes it run the daemon as plain Node instead of by chance
+                    // relying on the host having inherited the flag (P7, defensive).
+                    ELECTRON_RUN_AS_NODE: '1',
                 },
             },
         );
@@ -259,8 +272,32 @@ export class PatchwalkDaemonClient {
         }
     }
 
+    /** Lenient probe: what `serverKind` does whatever is on the port report (if anything)? */
+    private async probeServerKind(): Promise<string | undefined> {
+        try {
+            const body = await this.requestJson<{ serverKind?: unknown }>('/health', {
+                method: 'GET',
+            });
+            return typeof body?.serverKind === 'string' ? body.serverKind : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
     private async terminateIncompatibleProcessOnPort(): Promise<void> {
         if (process.platform === 'win32') {
+            return;
+        }
+
+        // P7: only terminate a process that identifies as a Patchwalk daemon. A stranger's process
+        // that happens to hold the port must NOT be killed — surface a clear error instead.
+        const serverKind = await this.probeServerKind();
+        if (!isReclaimablePatchwalkDaemon(serverKind)) {
+            if (await this.isPortOccupied()) {
+                throw new Error(
+                    `Patchwalk port ${this.options.port} is held by a non-Patchwalk process; refusing to terminate it. Free the port or change the patchwalk.daemonPort setting.`,
+                );
+            }
             return;
         }
 

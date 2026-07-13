@@ -14,13 +14,17 @@ import { z } from 'zod';
 import type {
     PatchwalkDaemonToWorkerMessage,
     PatchwalkPlaybackFailedMessage,
+    PatchwalkPlaybackProgressMessage,
+    PatchwalkPlaybackReadyMessage,
+    PatchwalkPlaybackStartedMessage,
     PatchwalkPlaybackState,
+    PatchwalkWalkOwnerMessage,
     PatchwalkWorkerHeartbeatMessage,
     PatchwalkWorkerRegisterMessage,
     PatchwalkWorkerUpdateMessage,
 } from '../lib/controlProtocol';
 import {
-    PATCHWALK_DEFAULT_PREPARE_TIMEOUT_MS,
+    PATCHWALK_DEFAULT_READY_TIMEOUT_MS,
     PATCHWALK_DEFAULT_STOP_TIMEOUT_MS,
     PATCHWALK_WORKER_SOCKET_PATH,
     patchwalkWorkerToDaemonMessageSchema,
@@ -30,6 +34,7 @@ import type {
     PatchwalkActiveHandoffStatusResource,
     PatchwalkDispatchStatusResource,
     PatchwalkStatusResource,
+    PatchwalkStatusResult,
     PatchwalkStopResult,
     PatchwalkWorkerStatusResource,
 } from '../lib/mcpCatalog';
@@ -38,25 +43,32 @@ import {
     createPatchwalkComposePromptText,
     createPatchwalkExampleHandoff,
     createPatchwalkExpandWalkthroughPromptText,
+    createPatchwalkOnboardingPromptText,
     createPatchwalkOperatorManual,
-    normalizePatchwalkPlayPayload,
+    createPatchwalkPlayInputShape,
+    createPatchwalkPlayPayloadSchema,
+    createPatchwalkPlayToolDescription,
     PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
     PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
+    PATCHWALK_COMPOSE_ONBOARDING_PROMPT_NAME,
     PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
     PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME,
     PATCHWALK_MCP_SERVER_INFO,
     PATCHWALK_OPERATOR_MANUAL_RESOURCE_URI,
     PATCHWALK_PLAY_TOOL_NAME,
     PATCHWALK_STATUS_RESOURCE_URI,
+    PATCHWALK_STATUS_TOOL_NAME,
     PATCHWALK_STOP_TOOL_NAME,
-    patchwalkPlayArgumentsSchema,
-    patchwalkPlayResultSchema,
+    patchwalkPlayResultShape,
+    patchwalkStatusResultShape,
     patchwalkStopResultSchema,
+    patchwalkStopResultShape,
 } from '../lib/mcpCatalog';
 import { normalizeAbsolutePath } from '../lib/pathUtils';
 import type { PatchwalkWorkerRoutingCandidate } from '../lib/routing';
 import { compareWorkerRoutingCandidates, matchBasePathToWorkspaceRoots } from '../lib/routing';
-import type { PatchwalkHandoffPayload } from '../lib/schema';
+import type { PatchwalkHandoffPayload, PatchwalkNarrationStyle } from '../lib/schema';
+import { formatPatchwalkValidationIssues, PATCHWALK_DEFAULT_NARRATION_STYLE } from '../lib/schema';
 
 interface PatchwalkMcpServerOptions {
     port: number;
@@ -94,24 +106,28 @@ interface RegisteredWorker {
     socket: WebSocket;
 }
 
-interface DispatchExecutionResult {
+interface DispatchLaunchResult {
     workerId: string;
     matchedRoot: string;
-    handoffId: string;
-    stepsPlayed: number;
+    walkId: string;
+    stepCount: number;
 }
 
 interface ActiveDispatch {
     dispatchId: string;
+    walkId: string;
     payload: PatchwalkHandoffPayload;
     createdAt: string;
-    state: 'preparing' | 'executing' | 'stopping';
+    state: 'preparing' | 'executing' | 'playing' | 'stopping';
     selectedWorkerId?: string;
     selectedMatchedRoot?: string;
-    resultPromise: Promise<DispatchExecutionResult>;
-    resolveResult: (value: DispatchExecutionResult) => void;
-    rejectResult: (error: Error) => void;
-    prepareFailureReject?: (error: Error) => void;
+    stepCount?: number;
+    currentStepIndex?: number;
+    /** Transient per-attempt handshake resolvers (positive acks replace silence-means-success). */
+    readyResolve?: () => void;
+    readyReject?: (error: Error) => void;
+    startedResolve?: (stepCount: number) => void;
+    startedReject?: (error: Error) => void;
     stopAcknowledgeResolve?: () => void;
     stopAcknowledgeReject?: (error: Error) => void;
 }
@@ -122,7 +138,6 @@ const MCP_PATH = '/mcp';
 const DAEMON_SHUTDOWN_PATH = '/daemon/shutdown';
 const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
 const STALE_WORKER_TIMEOUT_MS = 20_000;
-const EXECUTION_TIMEOUT_MS = 5 * 60_000;
 
 const createJsonRpcErrorResponse = (
     code: number,
@@ -150,12 +165,6 @@ const getRequestPath = (request: IncomingMessage): string => {
 const getSessionId = (request: IncomingMessage): string | undefined => {
     const headerValue = request.headers['mcp-session-id'];
     return typeof headerValue === 'string' && headerValue.length > 0 ? headerValue : undefined;
-};
-
-const createStoppedError = (): Error => {
-    const error = new Error('Patchwalk playback was stopped.');
-    error.name = 'PatchwalkPlaybackStoppedError';
-    return error;
 };
 
 const createTimeoutError = (message: string): Error => {
@@ -199,6 +208,17 @@ const patchwalkExpandWalkthroughPromptArgsSchema = {
         .describe('Optional detail preference such as concise, detailed, or exhaustive.'),
 };
 
+const patchwalkOnboardingPromptArgsSchema = {
+    codebasePath: z
+        .string()
+        .describe('Absolute path to the codebase root; used as the walk basePath.'),
+    area: z.string().optional().describe('Optional subsystem or area to focus the onboarding on.'),
+    depth: z
+        .string()
+        .optional()
+        .describe('Optional depth, e.g. "quick tour" or "in-depth guided walk".'),
+};
+
 const normalizeWorkspaceRoots = async (workspaceRoots: string[]): Promise<string[]> => {
     const normalizedRoots = await Promise.all(
         workspaceRoots.map((workspaceRoot) => normalizeAbsolutePath(workspaceRoot)),
@@ -216,6 +236,13 @@ export class PatchwalkMcpServer {
     private workerSequence = 0;
     private startedAt: string | null = null;
     private activeDispatch: ActiveDispatch | undefined;
+    /**
+     * The narration style the daemon hands to authoring agents. It is MACHINE-WIDE (the VS Code
+     * setting is `scope: "application"`, so every window reports the same value) and reaches the
+     * daemon over the worker socket. New MCP sessions pick up the current style; a session already
+     * open keeps the tool schema it was created with, so an agent sees a consistent contract.
+     */
+    private narrationStyle: PatchwalkNarrationStyle = PATCHWALK_DEFAULT_NARRATION_STYLE;
 
     public constructor(private readonly options: PatchwalkMcpServerOptions) {}
 
@@ -300,9 +327,10 @@ export class PatchwalkMcpServer {
         await Promise.allSettled(sessionIds.map((sessionId) => this.disposeSession(sessionId)));
 
         if (this.activeDispatch) {
-            this.activeDispatch.rejectResult(
-                new Error('Patchwalk daemon stopped before the dispatch completed.'),
-            );
+            const shutdownError = new Error('Patchwalk daemon stopped before the walk completed.');
+            this.activeDispatch.readyReject?.(shutdownError);
+            this.activeDispatch.startedReject?.(shutdownError);
+            this.activeDispatch.stopAcknowledgeReject?.(shutdownError);
             this.activeDispatch = undefined;
         }
 
@@ -624,6 +652,10 @@ export class PatchwalkMcpServer {
     }
 
     private createMcpServer(getSession: () => PatchwalkMcpSession | undefined): McpServer {
+        // The tool contract is built from the style ACTIVE WHEN THE SESSION IS CREATED, so an agent
+        // always sees a self-consistent schema + description + guide + prompts for one connection.
+        const sessionStyle = this.narrationStyle;
+
         const server = new McpServer(PATCHWALK_MCP_SERVER_INFO, {
             capabilities: {
                 logging: {},
@@ -688,7 +720,7 @@ export class PatchwalkMcpServer {
                         {
                             uri: PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
                             mimeType: 'application/json',
-                            text: `${JSON.stringify(createPatchwalkExampleHandoff(), null, 2)}\n`,
+                            text: `${JSON.stringify(createPatchwalkExampleHandoff(sessionStyle), null, 2)}\n`,
                         },
                     ],
                 };
@@ -709,7 +741,7 @@ export class PatchwalkMcpServer {
                         {
                             uri: PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
                             mimeType: 'text/markdown',
-                            text: `${createPatchwalkAuthoringGuide()}\n`,
+                            text: `${createPatchwalkAuthoringGuide(sessionStyle)}\n`,
                         },
                     ],
                 };
@@ -731,7 +763,7 @@ export class PatchwalkMcpServer {
                             role: 'user' as const,
                             content: {
                                 type: 'text' as const,
-                                text: createPatchwalkComposePromptText(args),
+                                text: createPatchwalkComposePromptText(args, sessionStyle),
                             },
                         },
                     ],
@@ -754,7 +786,33 @@ export class PatchwalkMcpServer {
                             role: 'user' as const,
                             content: {
                                 type: 'text' as const,
-                                text: createPatchwalkExpandWalkthroughPromptText(args),
+                                text: createPatchwalkExpandWalkthroughPromptText(
+                                    args,
+                                    sessionStyle,
+                                ),
+                            },
+                        },
+                    ],
+                };
+            },
+        );
+
+        server.registerPrompt(
+            PATCHWALK_COMPOSE_ONBOARDING_PROMPT_NAME,
+            {
+                title: 'Compose Patchwalk Onboarding Walk',
+                description:
+                    'Draft a spoken Patchwalk walk that onboards a newcomer to a whole codebase (or an area) — architecture, entrypoints, core modules, data flow, and conventions — the WHAT and the WHY, written to be heard.',
+                argsSchema: patchwalkOnboardingPromptArgsSchema,
+            },
+            async (args) => {
+                return {
+                    messages: [
+                        {
+                            role: 'user' as const,
+                            content: {
+                                type: 'text' as const,
+                                text: createPatchwalkOnboardingPromptText(args, sessionStyle),
                             },
                         },
                     ],
@@ -765,62 +823,94 @@ export class PatchwalkMcpServer {
         server.registerTool(
             PATCHWALK_PLAY_TOOL_NAME,
             {
-                title: 'Patchwalk Playback',
-                description:
-                    'Route a Patchwalk handoff to the best matching live editor window and play it there. Rejects immediately when another Patchwalk narration is already active anywhere on the machine.',
-                inputSchema: patchwalkPlayArgumentsSchema,
-                outputSchema: patchwalkPlayResultSchema,
+                title: 'Patchwalk Play Walk',
+                description: createPatchwalkPlayToolDescription(sessionStyle),
+                inputSchema: createPatchwalkPlayInputShape(sessionStyle),
+                outputSchema: patchwalkPlayResultShape,
                 annotations: {
                     openWorldHint: false,
                     readOnlyHint: false,
                 },
             },
             async (argumentsValue, extra) => {
-                const payload = await this.normalizePayload(
-                    normalizePatchwalkPlayPayload(argumentsValue),
-                );
+                // Validate against the ACTIVE STYLE's walk schema so a malformed or over-long payload
+                // gets a clear, actionable message instead of a cryptic transport error.
+                const validation =
+                    createPatchwalkPlayPayloadSchema(sessionStyle).safeParse(argumentsValue);
+                if (!validation.success) {
+                    // Report EVERY problem at once. Surfacing them one at a time turns a strict
+                    // schema into a guessing game and makes the tool feel like a fight.
+                    const problems = formatPatchwalkValidationIssues(validation.error);
+                    const listed = problems.slice(0, 25);
+                    const remaining = problems.length - listed.length;
+                    return {
+                        isError: true,
+                        content: [
+                            {
+                                type: 'text' as const,
+                                text: [
+                                    `Patchwalk rejected this walk (${problems.length} problem${
+                                        problems.length === 1 ? '' : 's'
+                                    }). Fix ALL of them in one pass, then call ${PATCHWALK_PLAY_TOOL_NAME} again:`,
+                                    '',
+                                    ...listed.map((problem) => `- ${problem}`),
+                                    ...(remaining > 0 ? [`- ...and ${remaining} more.`] : []),
+                                    '',
+                                    'Length limits are a hard gate, not a suggestion: the walk is SPOKEN ALOUD to a human who cannot skim it. Cut to the signal — what changed, why, what it risks — and delete filler, hedging, and anything that restates the code.',
+                                    'See patchwalk://handoff/authoring-guide and patchwalk://handoff/example.',
+                                ].join('\n'),
+                            },
+                        ],
+                    };
+                }
+                const payload = await this.normalizePayload(validation.data);
                 const session = getSession();
 
-                logger.info('MCP tool call started playback routing.', {
+                logger.info('MCP tool call requested a walk launch.', {
                     handoffId: payload.handoffId,
                     basePath: payload.basePath,
                     sessionId: extra.sessionId ?? null,
                 });
 
                 try {
-                    const dispatchResult = await this.dispatchPlayback(payload);
+                    // Launch + ack (P2): resolve as soon as the window has STARTED the walk, never
+                    // when it finishes. The developer drives the running walk from the sidebar.
+                    const launch = await this.dispatchPlayback(payload);
                     await server.sendLoggingMessage(
                         {
                             level: 'info',
-                            data: `Completed Patchwalk playback for ${payload.handoffId} via worker ${dispatchResult.workerId}`,
+                            data: `Launched Patchwalk walk ${payload.handoffId} in worker ${launch.workerId}`,
                         },
                         extra.sessionId,
                     );
 
                     return {
                         structuredContent: {
+                            status: 'launched' as const,
+                            walkId: launch.walkId,
                             handoffId: payload.handoffId,
-                            status: 'completed' as const,
-                            stepsPlayed: dispatchResult.stepsPlayed,
-                            workerId: dispatchResult.workerId,
-                            matchedRoot: dispatchResult.matchedRoot,
+                            workerId: launch.workerId,
+                            matchedRoot: launch.matchedRoot,
+                            steps: launch.stepCount,
                         },
                         content: [
                             {
                                 type: 'text' as const,
-                                text: `Patchwalk playback completed for ${payload.handoffId}.`,
+                                text: `Patchwalk launched the walk for ${payload.handoffId} in window ${launch.workerId} (${launch.stepCount} segments). The developer drives it from the Patchwalk sidebar; call ${PATCHWALK_STATUS_TOOL_NAME} to check progress or ${PATCHWALK_STOP_TOOL_NAME} to end it.`,
                             },
-                            {
-                                type: 'text' as const,
-                                text: session
-                                    ? `Session ${session.id} handled ${session.requestCount} MCP request(s).`
-                                    : `Worker ${dispatchResult.workerId} handled the playback.`,
-                            },
+                            ...(session
+                                ? [
+                                      {
+                                          type: 'text' as const,
+                                          text: `MCP session ${session.id} · ${session.requestCount} request(s).`,
+                                      },
+                                  ]
+                                : []),
                         ],
                     };
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error);
-                    logger.error('MCP tool call failed during playback routing.', {
+                    logger.error('MCP tool call failed to launch a walk.', {
                         handoffId: payload.handoffId,
                         sessionId: extra.sessionId ?? null,
                         error: message,
@@ -831,7 +921,7 @@ export class PatchwalkMcpServer {
                         content: [
                             {
                                 type: 'text' as const,
-                                text: `Patchwalk playback failed for ${payload.handoffId}: ${message}`,
+                                text: `Patchwalk could not launch the walk for ${payload.handoffId}: ${message}`,
                             },
                         ],
                     };
@@ -846,7 +936,7 @@ export class PatchwalkMcpServer {
                 description:
                     'Stop the single active Patchwalk narration running anywhere on the local machine.',
                 inputSchema: {},
-                outputSchema: patchwalkStopResultSchema,
+                outputSchema: patchwalkStopResultShape,
                 annotations: {
                     openWorldHint: false,
                     readOnlyHint: false,
@@ -886,6 +976,39 @@ export class PatchwalkMcpServer {
             },
         );
 
+        server.registerTool(
+            PATCHWALK_STATUS_TOOL_NAME,
+            {
+                title: 'Patchwalk Walk Status',
+                description:
+                    'Report the single active Patchwalk walk on this machine — window, step index/total, and state — or that nothing is playing.',
+                inputSchema: {},
+                outputSchema: patchwalkStatusResultShape,
+                annotations: {
+                    openWorldHint: false,
+                    readOnlyHint: true,
+                },
+            },
+            async () => {
+                const status = this.createStatusToolResult();
+                return {
+                    structuredContent: status,
+                    content: [
+                        {
+                            type: 'text' as const,
+                            text: status.active
+                                ? `Patchwalk is playing walk ${
+                                      status.handoffId ?? '(unknown)'
+                                  } in worker ${status.workerId ?? '(unknown)'} — segment ${
+                                      (status.stepIndex ?? 0) + 1
+                                  }/${status.stepCount ?? '?'} (${status.state ?? 'playing'}).`
+                                : 'No active Patchwalk walk.',
+                        },
+                    ],
+                };
+            },
+        );
+
         return server;
     }
 
@@ -895,9 +1018,11 @@ export class PatchwalkMcpServer {
             `Read ${PATCHWALK_STATUS_RESOURCE_URI} for daemon, worker, and active handoff status.`,
             `Read ${PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI} for a valid payload example.`,
             `Read ${PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI} before generating payloads for non-trivial changes.`,
-            `Use ${PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME} or ${PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME} to draft handoff content.`,
+            `Use ${PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME} or ${PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME} to draft a change walk, or ${PATCHWALK_COMPOSE_ONBOARDING_PROMPT_NAME} to draft a whole-codebase onboarding walk.`,
             `Call ${PATCHWALK_PLAY_TOOL_NAME} with a Patchwalk handoff payload that includes basePath and meaningful developer-facing narration.`,
             `Call ${PATCHWALK_STOP_TOOL_NAME} to stop the one active Patchwalk narration.`,
+            `Call ${PATCHWALK_STATUS_TOOL_NAME} to check the active walk's window, progress, and state.`,
+            `${PATCHWALK_PLAY_TOOL_NAME} returns as soon as the walk is launched; it does not block until narration finishes.`,
         ].join(' ');
     }
 
@@ -945,6 +1070,7 @@ export class PatchwalkMcpServer {
             prompts: [
                 PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
                 PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME,
+                PATCHWALK_COMPOSE_ONBOARDING_PROMPT_NAME,
             ],
             resources: [
                 PATCHWALK_STATUS_RESOURCE_URI,
@@ -952,7 +1078,23 @@ export class PatchwalkMcpServer {
                 PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
                 PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
             ],
-            tools: [PATCHWALK_PLAY_TOOL_NAME, PATCHWALK_STOP_TOOL_NAME],
+            tools: [PATCHWALK_PLAY_TOOL_NAME, PATCHWALK_STOP_TOOL_NAME, PATCHWALK_STATUS_TOOL_NAME],
+        };
+    }
+
+    private createStatusToolResult(): PatchwalkStatusResult {
+        const active = this.createActiveHandoffStatusResource();
+        if (!active) {
+            return { active: false };
+        }
+        return {
+            active: true,
+            walkId: this.activeDispatch?.walkId,
+            handoffId: active.handoffId ?? undefined,
+            workerId: active.workerId ?? undefined,
+            state: active.state,
+            stepIndex: this.activeDispatch?.currentStepIndex,
+            stepCount: this.activeDispatch?.stepCount,
         };
     }
 
@@ -1034,6 +1176,15 @@ export class PatchwalkMcpServer {
             case 'worker.heartbeat':
                 this.handleWorkerHeartbeat(message);
                 return;
+            case 'playback.ready':
+                this.handlePlaybackReady(message);
+                return;
+            case 'playback.started':
+                this.handlePlaybackStarted(message);
+                return;
+            case 'playback.progress':
+                this.handlePlaybackProgress(message);
+                return;
             case 'playback.completed':
                 this.handlePlaybackCompleted(message);
                 return;
@@ -1042,6 +1193,11 @@ export class PatchwalkMcpServer {
                 return;
             case 'playback.stopped':
                 this.handlePlaybackStopped(message);
+                return;
+            case 'playback.paused':
+            case 'playback.resumed':
+                // Pause/resume are reported to the daemon via playback.progress state; these
+                // explicit acks are reserved for future use and need no dispatch action today.
                 return;
         }
     }
@@ -1052,6 +1208,7 @@ export class PatchwalkMcpServer {
     ): Promise<void> {
         const workspaceRoots = await normalizeWorkspaceRoots(message.workspaceRoots);
         const existingWorker = this.workers.get(message.workerId);
+        this.applyNarrationStyle(message.narrationStyle);
 
         if (existingWorker && existingWorker.socket !== socket) {
             existingWorker.socket.close();
@@ -1090,10 +1247,30 @@ export class PatchwalkMcpServer {
             workspaceRootCount: registeredWorker.workspaceRoots.length,
             playbackState: registeredWorker.playbackState,
         });
+
+        // A window that connects mid-walk still learns which window is currently playing.
+        this.trySendWorkerMessage(
+            registeredWorker.workerId,
+            this.buildWalkOwnerMessage(registeredWorker.workerId),
+        );
+    }
+
+    /**
+     * Adopt the machine-wide narration style reported by a window. Sessions opened AFTER this point
+     * get the new tool schema, description, guide and prompts; sessions already open keep the
+     * contract they were created with, so an agent never sees the rules change mid-connection.
+     */
+    private applyNarrationStyle(style: PatchwalkNarrationStyle | undefined): void {
+        if (!style || style === this.narrationStyle) {
+            return;
+        }
+        logger.info('Narration style changed.', { from: this.narrationStyle, to: style });
+        this.narrationStyle = style;
     }
 
     private async handleWorkerUpdate(message: PatchwalkWorkerUpdateMessage): Promise<void> {
         const worker = this.workers.get(message.workerId);
+        this.applyNarrationStyle(message.narrationStyle);
         if (!worker) {
             return;
         }
@@ -1115,6 +1292,58 @@ export class PatchwalkMcpServer {
         worker.activeHandoffId = message.activeHandoffId ?? null;
     }
 
+    private isForActiveDispatch(dispatchId: string, workerId: string): boolean {
+        return (
+            this.activeDispatch !== undefined &&
+            this.activeDispatch.dispatchId === dispatchId &&
+            this.activeDispatch.selectedWorkerId === workerId
+        );
+    }
+
+    private clearActiveDispatch(dispatchId: string): void {
+        if (this.activeDispatch?.dispatchId === dispatchId) {
+            this.activeDispatch = undefined;
+            // The machine-wide walk ended; tell every window to drop its "playing" signal.
+            this.broadcastWalkOwner();
+        }
+    }
+
+    private handlePlaybackReady(message: PatchwalkPlaybackReadyMessage): void {
+        if (this.isForActiveDispatch(message.dispatchId, message.workerId)) {
+            this.activeDispatch?.readyResolve?.();
+        }
+    }
+
+    private handlePlaybackStarted(message: PatchwalkPlaybackStartedMessage): void {
+        const worker = this.workers.get(message.workerId);
+        if (worker) {
+            worker.playbackState = 'playing';
+            worker.activeHandoffId = message.handoffId;
+        }
+
+        if (this.isForActiveDispatch(message.dispatchId, message.workerId) && this.activeDispatch) {
+            this.activeDispatch.state = 'playing';
+            this.activeDispatch.stepCount = message.stepCount;
+            this.activeDispatch.currentStepIndex = 0;
+            this.activeDispatch.startedResolve?.(message.stepCount);
+            // Tell every window which one is now playing (Problem 4: which-window signal).
+            this.broadcastWalkOwner();
+        }
+    }
+
+    private handlePlaybackProgress(message: PatchwalkPlaybackProgressMessage): void {
+        const worker = this.workers.get(message.workerId);
+        if (worker) {
+            worker.playbackState = message.playbackState;
+            worker.activeHandoffId = message.playbackState === 'idle' ? null : message.handoffId;
+        }
+
+        if (this.isForActiveDispatch(message.dispatchId, message.workerId) && this.activeDispatch) {
+            this.activeDispatch.currentStepIndex = message.stepIndex;
+            this.activeDispatch.stepCount = message.stepCount;
+        }
+    }
+
     private handlePlaybackCompleted(message: {
         dispatchId: string;
         handoffId: string;
@@ -1127,28 +1356,17 @@ export class PatchwalkMcpServer {
             worker.activeHandoffId = null;
         }
 
-        if (
-            !this.activeDispatch ||
-            this.activeDispatch.dispatchId !== message.dispatchId ||
-            this.activeDispatch.selectedWorkerId !== message.workerId
-        ) {
+        if (!this.isForActiveDispatch(message.dispatchId, message.workerId)) {
             return;
         }
 
-        logger.info('Worker reported completed playback.', {
+        logger.info('Worker reported completed walk.', {
             workerId: message.workerId,
             dispatchId: message.dispatchId,
             handoffId: message.handoffId,
             stepsPlayed: message.stepsPlayed,
         });
-
-        this.activeDispatch.resolveResult({
-            workerId: message.workerId,
-            matchedRoot:
-                this.activeDispatch.selectedMatchedRoot ?? this.activeDispatch.payload.basePath,
-            handoffId: message.handoffId,
-            stepsPlayed: message.stepsPlayed,
-        });
+        this.clearActiveDispatch(message.dispatchId);
     }
 
     private handlePlaybackFailed(message: PatchwalkPlaybackFailedMessage): void {
@@ -1158,31 +1376,37 @@ export class PatchwalkMcpServer {
             worker.activeHandoffId = null;
         }
 
-        if (
-            !this.activeDispatch ||
-            this.activeDispatch.dispatchId !== message.dispatchId ||
-            this.activeDispatch.selectedWorkerId !== message.workerId
-        ) {
+        if (!this.isForActiveDispatch(message.dispatchId, message.workerId)) {
+            return;
+        }
+        const dispatch = this.activeDispatch;
+        if (!dispatch) {
             return;
         }
 
         if (message.phase === 'prepare') {
-            this.activeDispatch.prepareFailureReject?.(new Error(message.error));
+            // Negative prepare ack → the dispatch fails over to the next ranked window.
+            dispatch.readyReject?.(new Error(message.error));
             return;
         }
 
         if (message.phase === 'stop') {
-            this.activeDispatch.stopAcknowledgeReject?.(new Error(message.error));
+            dispatch.stopAcknowledgeReject?.(new Error(message.error));
             return;
         }
 
-        logger.error('Worker reported failed playback.', {
+        // Execute-phase failure. If it happens before the launch ack, unblock the launch as a
+        // hard failure (we already committed this window, so we do NOT silently retry another).
+        if (dispatch.startedReject) {
+            dispatch.startedReject(new Error(message.error));
+        }
+        logger.error('Worker reported failed walk.', {
             workerId: message.workerId,
             dispatchId: message.dispatchId,
             handoffId: message.handoffId,
             error: message.error,
         });
-        this.activeDispatch.rejectResult(new Error(message.error));
+        this.clearActiveDispatch(message.dispatchId);
     }
 
     private handlePlaybackStopped(message: {
@@ -1196,16 +1420,12 @@ export class PatchwalkMcpServer {
             worker.activeHandoffId = null;
         }
 
-        if (
-            !this.activeDispatch ||
-            this.activeDispatch.dispatchId !== message.dispatchId ||
-            this.activeDispatch.selectedWorkerId !== message.workerId
-        ) {
+        if (!this.isForActiveDispatch(message.dispatchId, message.workerId)) {
             return;
         }
 
-        this.activeDispatch.rejectResult(createStoppedError());
-        this.activeDispatch.stopAcknowledgeResolve?.();
+        this.activeDispatch?.stopAcknowledgeResolve?.();
+        this.clearActiveDispatch(message.dispatchId);
     }
 
     private handleWorkerDisconnect(socket: WebSocket): void {
@@ -1220,39 +1440,50 @@ export class PatchwalkMcpServer {
             remainingWorkerCount: this.workers.size,
         });
 
-        if (
-            this.activeDispatch &&
-            this.activeDispatch.selectedWorkerId === worker.workerId &&
-            this.activeDispatch.state === 'preparing'
-        ) {
-            this.activeDispatch.prepareFailureReject?.(
-                new Error(`Worker ${worker.workerId} disconnected before execution started.`),
-            );
+        this.teardownDispatchForLostWorker(worker.workerId);
+    }
+
+    /**
+     * Release the active dispatch (and any pending handshake) when the window it was dispatched to
+     * is gone. Shared by the socket-close path and the stale-worker prune so a window that vanishes
+     * WITHOUT a clean close event (hang / half-open socket / sleep-wake) can never wedge the
+     * machine-wide walk lock or leave every other window's "playing elsewhere" badge stuck.
+     */
+    private teardownDispatchForLostWorker(workerId: string): void {
+        const dispatch = this.activeDispatch;
+        if (!dispatch || dispatch.selectedWorkerId !== workerId) {
+            return;
         }
 
-        if (
-            this.activeDispatch &&
-            this.activeDispatch.selectedWorkerId === worker.workerId &&
-            this.activeDispatch.state === 'stopping'
-        ) {
-            this.activeDispatch.rejectResult(createStoppedError());
-            this.activeDispatch.stopAcknowledgeResolve?.();
+        if (dispatch.state === 'preparing') {
+            // Failover to the next candidate: the prepare handshake never completed.
+            dispatch.readyReject?.(
+                new Error(`Worker ${workerId} disconnected before it became ready.`),
+            );
+            return;
         }
 
-        if (
-            this.activeDispatch &&
-            this.activeDispatch.selectedWorkerId === worker.workerId &&
-            this.activeDispatch.state === 'executing'
-        ) {
-            this.activeDispatch.rejectResult(
-                new Error(`Worker ${worker.workerId} disconnected during playback.`),
+        if (dispatch.state === 'executing') {
+            dispatch.startedReject?.(
+                new Error(`Worker ${workerId} disconnected before starting the walk.`),
             );
+            this.clearActiveDispatch(dispatch.dispatchId);
+            return;
         }
+
+        if (dispatch.state === 'stopping') {
+            dispatch.stopAcknowledgeResolve?.();
+            this.clearActiveDispatch(dispatch.dispatchId);
+            return;
+        }
+
+        // 'playing': the walk was lost with its window; release the machine-wide lock + badges.
+        this.clearActiveDispatch(dispatch.dispatchId);
     }
 
     private async dispatchPlayback(
         payload: PatchwalkHandoffPayload,
-    ): Promise<DispatchExecutionResult> {
+    ): Promise<DispatchLaunchResult> {
         this.pruneStaleWorkers();
 
         if (this.hasAnyActiveHandoff()) {
@@ -1268,42 +1499,30 @@ export class PatchwalkMcpServer {
             );
         }
 
-        const resultState = {} as {
-            resolve?: (value: DispatchExecutionResult) => void;
-            reject?: (error: Error) => void;
-        };
-        const resultPromise = new Promise<DispatchExecutionResult>((resolve, reject) => {
-            resultState.resolve = resolve;
-            resultState.reject = reject;
-        });
-
         const dispatch: ActiveDispatch = {
             dispatchId: randomUUID(),
+            walkId: randomUUID(),
             payload,
             createdAt: new Date().toISOString(),
             state: 'preparing',
-            resultPromise,
-            resolveResult: resultState.resolve!,
-            rejectResult: resultState.reject!,
         };
         this.activeDispatch = dispatch;
-        logger.info('Dispatch created for playback request.', {
+        logger.info('Dispatch created for walk launch.', {
             dispatchId: dispatch.dispatchId,
+            walkId: dispatch.walkId,
             handoffId: payload.handoffId,
             basePath: payload.basePath,
             registeredWorkerCount: this.workers.size,
         });
 
         try {
+            // Resolves once a window has STARTED the walk. The dispatch intentionally stays active
+            // afterwards so later completed/stopped messages release the machine-wide lock; we only
+            // clear it here when the launch itself fails (no window could start the walk).
             return await this.tryDispatchCandidate(dispatch, rankedCandidates, 0);
-        } finally {
-            if (this.activeDispatch?.dispatchId === dispatch.dispatchId) {
-                this.activeDispatch = undefined;
-                logger.info('Dispatch removed from active registry.', {
-                    dispatchId: dispatch.dispatchId,
-                    remainingActiveDispatches: this.activeDispatch ? 1 : 0,
-                });
-            }
+        } catch (error) {
+            this.clearActiveDispatch(dispatch.dispatchId);
+            throw error;
         }
     }
 
@@ -1311,7 +1530,7 @@ export class PatchwalkMcpServer {
         dispatch: ActiveDispatch,
         rankedCandidates: PatchwalkWorkerRoutingCandidate[],
         index: number,
-    ): Promise<DispatchExecutionResult> {
+    ): Promise<DispatchLaunchResult> {
         const candidate = rankedCandidates[index];
         if (!candidate) {
             throw new Error(
@@ -1327,7 +1546,6 @@ export class PatchwalkMcpServer {
         dispatch.selectedWorkerId = candidate.workerId;
         dispatch.selectedMatchedRoot = candidate.matchedRoot;
         dispatch.state = 'preparing';
-        selectedWorker.activeHandoffId = dispatch.payload.handoffId;
 
         this.sendWorkerMessage(candidate.workerId, {
             type: 'playback.prepare',
@@ -1340,10 +1558,11 @@ export class PatchwalkMcpServer {
         });
 
         try {
-            await this.waitForPrepareWindow(dispatch, candidate.workerId);
+            // P3: proceed only on a POSITIVE ready ack. A window that is wedged, busy, or gone
+            // cannot silently swallow the walk — the timeout/failure fails over to the next one.
+            await this.waitForReady(dispatch, candidate.workerId);
         } catch (error) {
-            selectedWorker.activeHandoffId = null;
-            logger.warn('Worker rejected or lost prepare phase.', {
+            logger.warn('Worker was not ready; failing over to the next candidate.', {
                 workerId: candidate.workerId,
                 dispatchId: dispatch.dispatchId,
                 error: error instanceof Error ? error.message : String(error),
@@ -1352,9 +1571,6 @@ export class PatchwalkMcpServer {
         }
 
         dispatch.state = 'executing';
-        selectedWorker.playbackState = 'playing';
-        selectedWorker.activeHandoffId = dispatch.payload.handoffId;
-
         this.sendWorkerMessage(candidate.workerId, {
             type: 'playback.execute',
             messageId: randomUUID(),
@@ -1364,45 +1580,47 @@ export class PatchwalkMcpServer {
             payload: dispatch.payload,
         });
 
-        return withTimeout(
-            dispatch.resultPromise,
-            EXECUTION_TIMEOUT_MS,
-            `Worker ${candidate.workerId} did not complete playback in time.`,
-        );
+        // Once execute is sent we are committed to this window: a missing start ack is a hard
+        // failure, not a failover (failing over could make two windows play the same walk).
+        const stepCount = await this.waitForStarted(dispatch, candidate.workerId);
+
+        dispatch.state = 'playing';
+        return {
+            workerId: candidate.workerId,
+            matchedRoot: candidate.matchedRoot,
+            walkId: dispatch.walkId,
+            stepCount,
+        };
     }
 
     private async stopActivePlayback(): Promise<PatchwalkStopResult> {
-        const activeDispatch = this.activeDispatch;
-        if (!activeDispatch) {
-            return {
-                status: 'idle',
-            };
+        const dispatch = this.activeDispatch;
+        if (!dispatch) {
+            // No dispatch, but a window may still be PLAYING (e.g. its socket blipped and the
+            // dispatch was released while local playback continued). Stop it by worker state so the
+            // stop tool never falsely reports idle while a walk is audibly running.
+            return this.stopPlayingWorkerWithoutDispatch();
         }
 
-        if (!activeDispatch.selectedWorkerId) {
-            activeDispatch.rejectResult(createStoppedError());
-            this.activeDispatch = undefined;
-            return {
-                status: 'stopped',
-                handoffId: activeDispatch.payload.handoffId,
-            };
+        if (!dispatch.selectedWorkerId) {
+            this.clearActiveDispatch(dispatch.dispatchId);
+            return { status: 'stopped', handoffId: dispatch.payload.handoffId };
         }
 
-        const worker = this.workers.get(activeDispatch.selectedWorkerId);
+        const worker = this.workers.get(dispatch.selectedWorkerId);
         if (!worker) {
-            activeDispatch.rejectResult(createStoppedError());
-            this.activeDispatch = undefined;
+            this.clearActiveDispatch(dispatch.dispatchId);
             return {
                 status: 'stopped',
-                handoffId: activeDispatch.payload.handoffId,
-                workerId: activeDispatch.selectedWorkerId,
+                handoffId: dispatch.payload.handoffId,
+                workerId: dispatch.selectedWorkerId,
             };
         }
 
-        activeDispatch.state = 'stopping';
+        dispatch.state = 'stopping';
         const stopAcknowledged = new Promise<void>((resolve, reject) => {
-            activeDispatch.stopAcknowledgeResolve = resolve;
-            activeDispatch.stopAcknowledgeReject = reject;
+            dispatch.stopAcknowledgeResolve = resolve;
+            dispatch.stopAcknowledgeReject = reject;
         });
 
         this.sendWorkerMessage(worker.workerId, {
@@ -1410,8 +1628,8 @@ export class PatchwalkMcpServer {
             messageId: randomUUID(),
             workerId: worker.workerId,
             sentAt: new Date().toISOString(),
-            dispatchId: activeDispatch.dispatchId,
-            handoffId: activeDispatch.payload.handoffId,
+            dispatchId: dispatch.dispatchId,
+            handoffId: dispatch.payload.handoffId,
             reason: 'Patchwalk stop tool requested cancellation.',
         });
 
@@ -1421,14 +1639,49 @@ export class PatchwalkMcpServer {
             `Worker ${worker.workerId} did not acknowledge stop in time.`,
         );
 
-        if (this.activeDispatch?.dispatchId === activeDispatch.dispatchId) {
-            this.activeDispatch = undefined;
-        }
-
+        this.clearActiveDispatch(dispatch.dispatchId);
         return {
             status: 'stopped',
-            handoffId: activeDispatch.payload.handoffId,
+            handoffId: dispatch.payload.handoffId,
             workerId: worker.workerId,
+        };
+    }
+
+    /**
+     * Last-resort stop when the daemon has no tracked dispatch but a window still reports playing
+     * (e.g. its socket blipped mid-walk and the dispatch was released while local playback
+     * continued). Sends the stop directly to that window's runner so the stop tool is never a
+     * silent no-op.
+     */
+    private stopPlayingWorkerWithoutDispatch(): PatchwalkStopResult {
+        const playingWorker = [...this.workers.values()].find(
+            (worker) => worker.playbackState !== 'idle',
+        );
+        if (!playingWorker) {
+            return { status: 'idle' };
+        }
+
+        const handoffId = playingWorker.activeHandoffId ?? undefined;
+        try {
+            this.sendWorkerMessage(playingWorker.workerId, {
+                type: 'playback.stop',
+                messageId: randomUUID(),
+                workerId: playingWorker.workerId,
+                sentAt: new Date().toISOString(),
+                dispatchId: randomUUID(),
+                handoffId: handoffId ?? 'unknown-handoff',
+                reason: 'Patchwalk stop tool requested cancellation (no active dispatch).',
+            });
+        } catch {
+            // The socket is already gone, so the walk is unreachable; report it stopped anyway.
+        }
+        playingWorker.playbackState = 'idle';
+        playingWorker.activeHandoffId = null;
+        this.broadcastWalkOwner();
+        return {
+            status: 'stopped',
+            workerId: playingWorker.workerId,
+            ...(handoffId ? { handoffId } : {}),
         };
     }
 
@@ -1461,23 +1714,94 @@ export class PatchwalkMcpServer {
         worker.socket.send(JSON.stringify(message));
     }
 
-    private async waitForPrepareWindow(dispatch: ActiveDispatch, workerId: string): Promise<void> {
-        try {
-            await Promise.race([
-                new Promise<void>((_resolve, reject) => {
-                    dispatch.prepareFailureReject = reject;
-                }),
-                new Promise<void>((resolve) => {
-                    setTimeout(resolve, PATCHWALK_DEFAULT_PREPARE_TIMEOUT_MS);
-                }),
-            ]);
-        } finally {
-            dispatch.prepareFailureReject = undefined;
+    /** Best-effort send that silently skips a closed socket (used for owner broadcasts). */
+    private trySendWorkerMessage(workerId: string, message: PatchwalkDaemonToWorkerMessage): void {
+        const worker = this.workers.get(workerId);
+        if (!worker || worker.socket.readyState !== WebSocket.OPEN) {
+            return;
         }
+        worker.socket.send(JSON.stringify(message));
+    }
 
-        if (dispatch.selectedWorkerId !== workerId) {
-            throw new Error(`Worker ${workerId} lost prepare ownership.`);
+    private buildWalkOwnerMessage(workerId: string): PatchwalkWalkOwnerMessage {
+        const dispatch = this.activeDispatch;
+        // A walk "owns" a window only once it is actually PLAYING. Broadcasts fire on the started
+        // transition, so gating on 'playing' keeps a mid-prepare register message consistent with
+        // what already-connected windows were told (they get nothing until 'started').
+        const active = Boolean(
+            dispatch && dispatch.state === 'playing' && dispatch.selectedWorkerId,
+        );
+        return {
+            type: 'walk.owner',
+            messageId: randomUUID(),
+            workerId,
+            sentAt: new Date().toISOString(),
+            active,
+            ...(active && dispatch
+                ? {
+                      ownerWorkerId: dispatch.selectedWorkerId,
+                      handoffId: dispatch.payload.handoffId,
+                      revealPath: dispatch.selectedMatchedRoot ?? dispatch.payload.basePath,
+                  }
+                : {}),
+        };
+    }
+
+    /** Tell every connected window which window currently owns the active walk (or that none does). */
+    private broadcastWalkOwner(): void {
+        for (const workerId of this.workers.keys()) {
+            this.trySendWorkerMessage(workerId, this.buildWalkOwnerMessage(workerId));
         }
+    }
+
+    private waitForReady(dispatch: ActiveDispatch, workerId: string): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
+            // cleanup() has to clear a timer that does not exist yet, so the handle lives in a box.
+            const timeout: { handle?: NodeJS.Timeout } = {};
+            const cleanup = (): void => {
+                clearTimeout(timeout.handle);
+                dispatch.readyResolve = undefined;
+                dispatch.readyReject = undefined;
+            };
+            timeout.handle = setTimeout(() => {
+                cleanup();
+                reject(createTimeoutError(`Worker ${workerId} did not become ready in time.`));
+            }, PATCHWALK_DEFAULT_READY_TIMEOUT_MS);
+            dispatch.readyResolve = () => {
+                cleanup();
+                resolve();
+            };
+            dispatch.readyReject = (error: Error) => {
+                cleanup();
+                reject(error);
+            };
+        });
+    }
+
+    private waitForStarted(dispatch: ActiveDispatch, workerId: string): Promise<number> {
+        return new Promise<number>((resolve, reject) => {
+            // cleanup() has to clear a timer that does not exist yet, so the handle lives in a box.
+            const timeout: { handle?: NodeJS.Timeout } = {};
+            const cleanup = (): void => {
+                clearTimeout(timeout.handle);
+                dispatch.startedResolve = undefined;
+                dispatch.startedReject = undefined;
+            };
+            timeout.handle = setTimeout(() => {
+                cleanup();
+                reject(
+                    createTimeoutError(`Worker ${workerId} accepted but never started the walk.`),
+                );
+            }, PATCHWALK_DEFAULT_READY_TIMEOUT_MS);
+            dispatch.startedResolve = (stepCount: number) => {
+                cleanup();
+                resolve(stepCount);
+            };
+            dispatch.startedReject = (error: Error) => {
+                cleanup();
+                reject(error);
+            };
+        });
     }
 
     private hasAnyActiveHandoff(): boolean {
@@ -1499,6 +1823,10 @@ export class PatchwalkMcpServer {
                 });
                 worker.socket.close();
                 this.workers.delete(worker.workerId);
+                // The socket 'close' event fires asynchronously (after this delete), so
+                // handleWorkerDisconnect would no longer find the worker. Tear down the dispatch
+                // here so a hung/half-open playing window cannot wedge the walk lock (P: prune-wedge).
+                this.teardownDispatchForLostWorker(worker.workerId);
             }
         }
     }

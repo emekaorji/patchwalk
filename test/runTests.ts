@@ -13,9 +13,11 @@ import { runTests } from '@vscode/test-electron';
     const testWorkspace = resolve(projectPath, './test-workspace-primary');
 
     await runTests({
-        version: 'insiders',
+        version: 'stable',
         extensionDevelopmentPath,
         extensionTestsPath,
-        launchArgs: ['--disable-extensions', testWorkspace],
+        // A fresh isolated user-data dir already means no third-party extensions load, so
+        // `--disable-extensions` is unnecessary — and some recent VS Code builds reject it here.
+        launchArgs: [testWorkspace],
     });
 })();

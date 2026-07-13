@@ -8,7 +8,9 @@ import Mocha from 'mocha';
  * here has to change with it.
  */
 export function run(testsRoot: string, cb: (error: any, failures?: number) => void): void {
-    const mocha = new Mocha({ color: true });
+    // 20s default: some control-plane tests deliberately wait on the ready-timeout (~2s), which
+    // exceeds Mocha's 2s default and would otherwise flake inside the electron host.
+    const mocha = new Mocha({ color: true, timeout: 20_000 });
 
     try {
         const files = globSync('**/**.test.js', { cwd: testsRoot });

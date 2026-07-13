@@ -3,11 +3,14 @@ src
 scripts
 assets
 !assets/logo.png
+!assets/patchwalk-activitybar.svg
 
-# output
-out
-!out/src/extension.js
-*.map
+# output — ship the two esbuild bundles the extension host + spawned daemon run from
+# (out/src/extension/index.js and out/src/daemon/index.js), but nothing else under out/.
+out/test
+out/**/*.map
+out/**/*.d.ts
+out/**/*.tsbuildinfo
 *.vsix
 
 # test
@@ -23,7 +26,17 @@ tsconfig.*
 .eslintrc*
 .prettier*
 .gitignore
+.gitattributes
+.nvmrc
+.npmrc
 pnpm-lock.yaml
+
+# dev-only docs + local/agent dirs (never shipped)
+PLAN.md
+BUILD_PROGRESS.md
+_local
+.codex
+.claude
 
 # esbuild-visualizer
 meta.json
