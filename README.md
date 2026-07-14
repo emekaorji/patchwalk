@@ -48,12 +48,43 @@ You drive the running walk from the Patchwalk sidebar (pause, next, stop, replay
 
 ## Install & set up
 
-1. Install the Patchwalk extension in VS Code or Cursor. On first activation it starts the bundled
-   daemon automatically — you do **not** install a separate MCP server.
-2. Point your agent at the MCP endpoint: `http://127.0.0.1:7357/mcp` (Streamable HTTP).
-   For example, add it to your Claude Code / Codex MCP config, then tell the agent to call
-   `patchwalk.play` after each change.
-3. Open the project you're working in as a workspace folder so the daemon can route walks to it.
+1. **Install the extension.** On first activation it starts a small local daemon automatically — you
+   do _not_ install a separate MCP server. It shuts itself down when no editor windows are left.
+
+2. **Point your agent at it.** This is the only required step; without it Patchwalk has nothing to
+   say. The endpoint is `http://127.0.0.1:7357/mcp` (Streamable HTTP).
+
+   **Claude Code**
+
+   ```bash
+   claude mcp add --transport http patchwalk http://127.0.0.1:7357/mcp
+   ```
+
+   **Any editor/agent that uses an `mcpServers` JSON config** (`.mcp.json`, Cursor, Windsurf, …)
+
+   ```json
+   {
+     "mcpServers": {
+       "patchwalk": { "type": "http", "url": "http://127.0.0.1:7357/mcp" }
+     }
+   }
+   ```
+
+   **Codex** (`~/.codex/config.toml`)
+
+   ```toml
+   [mcp_servers.patchwalk]
+   url = "http://127.0.0.1:7357/mcp"
+   ```
+
+   (The command **Patchwalk: Copy MCP Endpoint** copies the right URL if you changed the port.)
+
+3. **Ask for a walk.** After your agent makes a change:
+
+   > _"Walk me through what you just changed."_
+
+   The agent calls `patchwalk.play`, and Patchwalk starts speaking in the window that owns that
+   project — highlighting each range as it goes.
 
 ---
 
@@ -115,19 +146,25 @@ Open the Patchwalk view in the activity bar to monitor and control a walk:
 - **Now Playing** — summary, current step, `i / N`, and transport controls: ⏮ ⏯ ⏹ ⏭ ↻.
 - **Walk transcript** — every step's narration; the current one is highlighted; **click a step to
   jump** to its file and range. The reasoning persists here after the voice moves on.
-- **Voices** — pick the narration voice, or download a local neural voice (below).
+- **Voices** — pick the narration voice, and pick your system voice (neural voices are experimental and not yet available) (below).
 
 ---
 
 ## Voice
 
-By default Patchwalk uses your OS voice — macOS `say`, Windows SAPI, Linux `espeak-ng` — with no
-setup, offline, and private.
+Patchwalk speaks with your **OS voice** — macOS `say`, Windows SAPI, Linux `espeak-ng`. No setup, no
+API key, fully offline, nothing leaves your machine.
 
-For a more natural, human-sounding walk, download a **local neural voice** (e.g. Kokoro) from the
-**Voices** panel. It runs fully offline via a bundled runtime, with no API keys. If a neural voice
-can't run on your machine, Patchwalk falls back to the system voice and tells you honestly rather
-than playing silence.
+Pick which one with `patchwalk.systemVoice` (e.g. `Samantha`, `Daniel`). This matters more than it
+sounds: voices differ a lot in how fast they synthesize, and a slow one puts audible pauses between
+segments. Run `say -v '?'` on macOS to list them.
+
+Patchwalk renders the _next_ line's audio while the current one is still playing, so you don't hear
+the speech engine start up between every segment.
+
+> **Neural voices (Kokoro) are experimental and not available yet.** They appear in the Voices panel
+> marked as such, with the download disabled. They need pinned model assets and a native runtime that
+> this release does not ship — rather than give you a button that fails, we've turned it off.
 
 ---
 
@@ -135,14 +172,25 @@ than playing silence.
 
 **Commands**
 
-- `Patchwalk: Restart Daemon` · `Patchwalk: Show Daemon Status` · `Patchwalk: Stop Daemon`
+- `Patchwalk: Restart Daemon`
+- `Patchwalk: Show Daemon Status`
+- `Patchwalk: Stop Daemon`
 - `Patchwalk: Play Walk From Clipboard`
+- `Patchwalk: Reveal Playing Window`
+- `Patchwalk: Copy MCP Endpoint`
 
 **Settings**
 
 - `patchwalk.daemonPort` (default `7357`) — the local daemon port.
-- `patchwalk.voice` (default `"system"`) — active voice; set to a downloaded neural voice id from
-  the Voices panel.
+- `patchwalk.voice` (default `"system"`) — active voice engine. `system` today; neural voices are experimental and not yet available.
+- `patchwalk.overviewEditor` (default `true`) — open the agenda/stats editor beside your code while a walk plays.
+- `patchwalk.autoRevealSidebar` (default `true`) — reveal the Patchwalk sidebar in the window that starts narrating.
+- `patchwalk.tintWindowDuringPlayback` (default `false`) — tint the window chrome while a walk plays, so you can spot the talking window. Writes `workbench.colorCustomizations` to the workspace while playing, and restores it after.
+- `patchwalk.narrationStyle` (default `"terse"`) — `terse` (dense, high-signal) or `grounded` (more explanatory). Global only — it rewrites the instructions the daemon gives your agent, and one daemon serves every window.
+- `patchwalk.pacing.stepGapMs` (default `0`) — extra silence before a new step. `0` keeps the walk one continuous passage.
+- `patchwalk.pacing.subSegmentGapMs` (default `0`) — extra silence between sub-segments inside a step.
+- `patchwalk.systemVoice` — which OS voice narrates (e.g. `Samantha`, `Daniel`). Empty = your OS default. Affects pacing noticeably.
+- `patchwalk.prefetchAudio` (default `true`) — render the next line while the current one plays. This is what removes the pause between segments — leave it on unless you hit audio trouble.
 
 ---
 

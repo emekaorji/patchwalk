@@ -24,6 +24,7 @@ import type {
     PatchwalkWorkerUpdateMessage,
 } from '../lib/controlProtocol';
 import {
+    MAXIMUM_RECONNECT_DELAY_MS,
     PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS,
     PATCHWALK_DEFAULT_RECONNECT_DELAY_MS,
     PATCHWALK_WORKER_API_VERSION,
@@ -73,6 +74,8 @@ export class PatchwalkWorkerController
     private connectionPromise: Promise<void> | undefined;
     private messageQueue: Promise<void> = Promise.resolve();
     private stopping = false;
+    private reconnectAttempts = 0;
+    private portConflictReported = false;
     private daemonManagementEnabled = true;
     private heartbeatIntervalMs = PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS;
     private activePlayback: ActivePlaybackHandle | undefined;
@@ -355,18 +358,76 @@ export class PatchwalkWorkerController
         await this.sendMessage(this.createUpdateMessage());
     }
 
+    /**
+     * Back off on repeated failures. A fixed 1s retry against an unreachable daemon is a hot loop:
+     * every attempt shells out to `lsof`, so a permanently-blocked port turns into a process storm
+     * that the user never sees and never gets told about.
+     */
     private scheduleReconnect(): void {
         if (this.reconnectTimer || !this.daemonManagementEnabled) {
             return;
         }
 
+        const delayMs = Math.min(
+            PATCHWALK_DEFAULT_RECONNECT_DELAY_MS * 2 ** this.reconnectAttempts,
+            MAXIMUM_RECONNECT_DELAY_MS,
+        );
+        this.reconnectAttempts += 1;
+
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = undefined;
-            this.ensureConnected().catch((error: unknown) => {
-                this.reportError('Patchwalk worker reconnect failed', error);
-                this.scheduleReconnect();
+            this.ensureConnected()
+                .then(() => {
+                    this.reconnectAttempts = 0;
+                })
+                .catch((error: unknown) => {
+                    if (this.isPortBlockedError(error)) {
+                        // Someone else owns the port. Retrying can never fix that, so stop and say so.
+                        this.reportPortConflict(error);
+                        return;
+                    }
+                    this.reportError('Patchwalk worker reconnect failed', error);
+                    this.scheduleReconnect();
+                });
+        }, delayMs);
+    }
+
+    private isPortBlockedError(error: unknown): boolean {
+        return error instanceof Error && /held by a non-Patchwalk process/.test(error.message);
+    }
+
+    /** Terminal: stop retrying, tell the user once, and offer the only two things that help. */
+    private reportPortConflict(error: unknown): void {
+        this.daemonManagementEnabled = false;
+        this.clearReconnectTimer();
+        if (this.portConflictReported) {
+            return;
+        }
+        this.portConflictReported = true;
+
+        const message = error instanceof Error ? error.message : String(error);
+        this.options.outputChannel.appendLine(message);
+        void vscode.window
+            .showErrorMessage(
+                `Patchwalk could not start: port ${this.options.daemonPort} is in use by another program.`,
+                'Change port',
+                'Retry',
+            )
+            .then((choice) => {
+                if (choice === 'Change port') {
+                    void vscode.commands.executeCommand(
+                        'workbench.action.openSettings',
+                        'patchwalk.daemonPort',
+                    );
+                    return;
+                }
+                if (choice === 'Retry') {
+                    this.portConflictReported = false;
+                    this.daemonManagementEnabled = true;
+                    this.reconnectAttempts = 0;
+                    this.scheduleReconnect();
+                }
             });
-        }, PATCHWALK_DEFAULT_RECONNECT_DELAY_MS);
     }
 
     private clearReconnectTimer(): void {

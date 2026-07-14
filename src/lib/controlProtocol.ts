@@ -17,6 +17,8 @@ const nonNegativeIntegerSchema = z.number().int().gte(0);
 export const PATCHWALK_WORKER_API_VERSION = '2.1.0';
 export const PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
 export const PATCHWALK_DEFAULT_RECONNECT_DELAY_MS = 1_000;
+/** Ceiling for the reconnect backoff — a blocked port must not become a retry storm. */
+export const MAXIMUM_RECONNECT_DELAY_MS = 30_000;
 /** @deprecated Superseded by the positive `playback.ready` ack; kept for compatibility. */
 export const PATCHWALK_DEFAULT_PREPARE_TIMEOUT_MS = 300;
 /** How long the daemon waits for a positive `playback.ready` before failing over to the next window. */

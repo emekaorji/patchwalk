@@ -345,6 +345,55 @@ describe('patchwalk mcp server', () => {
         await Promise.allSettled([transport.terminateSession(), transport.close(), server.stop()]);
     });
 
+    it('shuts itself down once no editor window is left (it must not outlive the editor)', async function () {
+        this.timeout(10_000);
+        // A detached daemon that lingers after the editor closes — and survives an uninstall — is
+        // exactly what users find running on their machine weeks later.
+        let exited = false;
+        const idleServer = new PatchwalkMcpServer({
+            port: 0,
+            idleShutdownMs: 60,
+            idleCheckIntervalMs: 20,
+            onIdleShutdown: () => {
+                exited = true;
+            },
+        });
+        await idleServer.start();
+        ok(idleServer.listeningPort, 'the idle server should be listening');
+
+        // No worker ever attaches → it should give up and exit.
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        strictEqual(exited, true, 'the daemon must exit when it has no editor windows to serve');
+
+        await idleServer.stop().catch(() => {});
+    });
+
+    it('stays alive while an editor window is attached', async function () {
+        this.timeout(10_000);
+        let exited = false;
+        const busyServer = new PatchwalkMcpServer({
+            port: 0,
+            idleShutdownMs: 60,
+            idleCheckIntervalMs: 20,
+            onIdleShutdown: () => {
+                exited = true;
+            },
+        });
+        await busyServer.start();
+        const busyClient = new PatchwalkDaemonClient({
+            daemonEntryPath: '/unused/in-tests',
+            port: busyServer.listeningPort!,
+        });
+        const attached = new FakePatchwalkWorker(busyClient, ['/tmp/keep-alive']);
+        await attached.start();
+
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        strictEqual(exited, false, 'a daemon serving a live window must not shut down');
+
+        await attached.stop();
+        await busyServer.stop().catch(() => {});
+    });
+
     it('serves health checks and MCP capabilities from the daemon', async () => {
         const healthUrl = endpointUrl.replace(/\/mcp$/, '/health');
         const response = await fetch(healthUrl);

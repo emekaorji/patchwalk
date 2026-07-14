@@ -72,6 +72,12 @@ import { formatPatchwalkValidationIssues, PATCHWALK_DEFAULT_NARRATION_STYLE } fr
 
 interface PatchwalkMcpServerOptions {
     port: number;
+    /** Called when the daemon has had no editor windows for IDLE_SHUTDOWN_MS and should exit. */
+    onIdleShutdown?: () => void;
+    /** Override the idle window (tests). */
+    idleShutdownMs?: number;
+    /** Override how often idleness is checked (tests). */
+    idleCheckIntervalMs?: number;
 }
 
 interface JsonRpcErrorResponse {
@@ -138,6 +144,13 @@ const MCP_PATH = '/mcp';
 const DAEMON_SHUTDOWN_PATH = '/daemon/shutdown';
 const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
 const STALE_WORKER_TIMEOUT_MS = 20_000;
+/**
+ * The daemon exists to serve editor windows. When the last one goes away it has nothing to do, so
+ * it must NOT linger: a detached process that outlives the editor (and survives an uninstall) is
+ * exactly the kind of thing users find running on their machine weeks later and rightly resent.
+ */
+const IDLE_SHUTDOWN_MS = 5 * 60_000;
+const IDLE_CHECK_INTERVAL_MS = 30_000;
 
 const createJsonRpcErrorResponse = (
     code: number,
@@ -243,6 +256,9 @@ export class PatchwalkMcpServer {
      * open keeps the tool schema it was created with, so an agent sees a consistent contract.
      */
     private narrationStyle: PatchwalkNarrationStyle = PATCHWALK_DEFAULT_NARRATION_STYLE;
+    private idleTimer: NodeJS.Timeout | undefined;
+    /** When the last worker disconnected, or null while at least one window is attached. */
+    private idleSince: number | null = null;
 
     public constructor(private readonly options: PatchwalkMcpServerOptions) {}
 
@@ -315,6 +331,7 @@ export class PatchwalkMcpServer {
         });
 
         this.startedAt = new Date().toISOString();
+        this.startIdleWatchdog();
         logger.info('Patchwalk daemon server started.', {
             listeningPort: this.listeningPort ?? this.options.port,
             endpointUrl: this.endpointUrl ?? null,
@@ -323,6 +340,10 @@ export class PatchwalkMcpServer {
 
     public async stop(): Promise<void> {
         logger.info('Patchwalk daemon server shutdown started.');
+        if (this.idleTimer) {
+            clearInterval(this.idleTimer);
+            this.idleTimer = undefined;
+        }
         const sessionIds = [...this.sessions.keys()];
         await Promise.allSettled(sessionIds.map((sessionId) => this.disposeSession(sessionId)));
 
@@ -1810,6 +1831,45 @@ export class PatchwalkMcpServer {
         }
 
         return [...this.workers.values()].some((worker) => worker.playbackState !== 'idle');
+    }
+
+    /**
+     * Exit once no editor window has been attached for a while. `unref()` so this timer alone can
+     * never keep the process alive.
+     */
+    private startIdleWatchdog(): void {
+        const idleShutdownMs = this.options.idleShutdownMs ?? IDLE_SHUTDOWN_MS;
+        this.idleTimer = setInterval(() => {
+            this.pruneStaleWorkers();
+
+            const busy = this.workers.size > 0 || this.activeDispatch !== undefined;
+            if (busy) {
+                this.idleSince = null;
+                return;
+            }
+
+            if (this.idleSince === null) {
+                this.idleSince = Date.now();
+                return;
+            }
+
+            if (Date.now() - this.idleSince < idleShutdownMs) {
+                return;
+            }
+
+            logger.info('Patchwalk daemon is idle with no editor windows; shutting down.', {
+                idleMs: Date.now() - this.idleSince,
+            });
+            this.idleSince = null;
+            void this.stop()
+                .catch((error: unknown) => {
+                    logger.error('Patchwalk daemon failed to stop when idle.', error);
+                })
+                .finally(() => {
+                    this.options.onIdleShutdown?.();
+                });
+        }, this.options.idleCheckIntervalMs ?? IDLE_CHECK_INTERVAL_MS);
+        this.idleTimer.unref?.();
     }
 
     private pruneStaleWorkers(): void {

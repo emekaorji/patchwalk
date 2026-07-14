@@ -1,43 +1,50 @@
-# source
+# Deny-all under out/, then allow ONLY the two esbuild bundles the runtime actually loads.
+# `compile:test` also emits tsc output into out/, and without this allowlist it silently ships
+# ~300 KB of dead, unreachable modules alongside the bundles.
+out/**
+!out/src/extension/index.js
+!out/src/daemon/index.js
+
+# source + build tooling
 src
 scripts
-assets
-!assets/logo.png
-!assets/patchwalk-activitybar.svg
-
-# output — ship the two esbuild bundles the extension host + spawned daemon run from
-# (out/src/extension/index.js and out/src/daemon/index.js), but nothing else under out/.
-out/test
-out/**/*.map
-out/**/*.d.ts
-out/**/*.tsbuildinfo
-*.vsix
-
-# test
 test
 test-workspace-primary
 test-workspace-secondary
 .vscode-test
-
-# configs
-.github
-.vscode
 tsconfig.*
 .eslintrc*
 .prettier*
+.editorconfig
+
+# assets: ship only what the manifest references
+assets
+!assets/logo.png
+!assets/patchwalk-activitybar.svg
+
+# repo/dev files
+.github
+.vscode
 .gitignore
 .gitattributes
 .nvmrc
 .npmrc
 pnpm-lock.yaml
+package-lock.json
 
-# dev-only docs + local/agent dirs (never shipped)
+# dev-only docs and local/agent scratch (never shipped)
+# NOTE: `dir` alone does not exclude `dir/file` — `*` never crosses a `/`. Always use `dir/**`.
 PLAN.md
 BUILD_PROGRESS.md
 _local
+_local/**
 .codex
+.codex/**
 .claude
+.claude/**
 
-# esbuild-visualizer
+# local artifacts
+*.vsix
+*.handoff.json
 meta.json
 stats.html

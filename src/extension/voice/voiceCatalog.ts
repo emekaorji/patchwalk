@@ -25,6 +25,14 @@ export interface VoiceCatalogEntry {
     files: VoiceCatalogFile[];
     /** Sherpa Kokoro speaker id (0-based). */
     speakerId: number;
+    /**
+     * Can this voice actually be installed in a SHIPPED build?
+     *
+     * Neural voices need two things we do not ship yet: pinned model assets, and the sherpa-onnx
+     * NATIVE addon (which esbuild cannot bundle). Until both land, the voice is advertised as
+     * experimental and the download is disabled — an honest "not yet" beats a button that fails.
+     */
+    available: boolean;
 }
 
 export const VOICE_CATALOG: readonly VoiceCatalogEntry[] = [
@@ -36,8 +44,12 @@ export const VOICE_CATALOG: readonly VoiceCatalogEntry[] = [
         sizeMB: 90,
         license: 'Apache-2.0',
         speakerId: 0,
+        // Not installable yet: the asset URLs below are placeholders, and the sherpa-onnx native
+        // runtime is not shipped. The Voices panel therefore shows this as experimental and refuses
+        // to download it. Flip to `true` once BOTH are real.
+        available: false,
         files: [
-            // TODO(needs-manual): pin exact asset URLs + sha256 from the sherpa-onnx Kokoro release.
+            // TODO: pin exact asset URLs + sha256 from the sherpa-onnx Kokoro release.
             { name: 'model.onnx', url: 'https://example.invalid/kokoro-en/model.onnx' },
             { name: 'voices.bin', url: 'https://example.invalid/kokoro-en/voices.bin' },
             { name: 'tokens.txt', url: 'https://example.invalid/kokoro-en/tokens.txt' },

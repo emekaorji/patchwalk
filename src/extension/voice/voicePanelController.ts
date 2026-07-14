@@ -17,8 +17,10 @@ export interface VoicePanelControllerOptions {
     log: (message: string) => void;
 }
 
-/** Backs the sidebar's Voices panel: list/download/remove/select against the download + voice
-managers. */
+/**
+ * Backs the sidebar's Voices panel: list/download/remove/select against the download + voice
+ * managers.
+ */
 export class PatchwalkVoicePanelController implements VoicePanelController, vscode.Disposable {
     private readonly changeEmitter = new vscode.EventEmitter<void>();
     private readonly downloading = new Set<string>();
@@ -38,6 +40,7 @@ export class PatchwalkVoicePanelController implements VoicePanelController, vsco
                 kind: 'system',
                 installed: true,
                 downloading: false,
+                available: true,
             },
         ];
         for (const entry of VOICE_CATALOG) {
@@ -47,6 +50,8 @@ export class PatchwalkVoicePanelController implements VoicePanelController, vsco
                 kind: 'neural',
                 installed: await this.options.downloadManager.isInstalled(entry.id),
                 downloading: this.downloading.has(entry.id),
+                available: entry.available,
+                note: entry.available ? undefined : 'Experimental — not yet available',
             });
         }
         return {
@@ -59,6 +64,13 @@ export class PatchwalkVoicePanelController implements VoicePanelController, vsco
     public async download(voiceId: string): Promise<void> {
         const entry = findCatalogEntry(voiceId);
         if (!entry) {
+            return;
+        }
+        if (!entry.available) {
+            // The UI disables this, but never let a stray message start a download that cannot work.
+            this.options.log(
+                `Patchwalk voice "${entry.label}" is experimental and not available to download yet.`,
+            );
             return;
         }
         this.downloading.add(voiceId);

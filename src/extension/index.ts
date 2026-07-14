@@ -179,6 +179,18 @@ export function activate(context: vscode.ExtensionContext) {
         await vscode.window.showInformationMessage('Patchwalk daemon stopped.');
     });
 
+    // A fresh install is otherwise inert: nothing happens until an agent is pointed at the daemon.
+    const copyMcpEndpointCommand = vscode.commands.registerCommand(
+        'patchwalk.copyMcpEndpoint',
+        async () => {
+            const endpoint = `http://127.0.0.1:${readDaemonPort()}/mcp`;
+            await vscode.env.clipboard.writeText(endpoint);
+            await vscode.window.showInformationMessage(
+                `Copied ${endpoint} — add it to your agent's MCP config, then ask it to walk you through a change.`,
+            );
+        },
+    );
+
     const playFromClipboardCommand = vscode.commands.registerCommand(
         'patchwalk.playFromClipboard',
         async () => {
@@ -225,8 +237,30 @@ export function activate(context: vscode.ExtensionContext) {
         restartDaemonCommand,
         showDaemonStatusCommand,
         stopDaemonCommand,
+        copyMcpEndpointCommand,
         playFromClipboardCommand,
     );
+
+    // Tell a brand-new user the ONE thing they must do — exactly once, ever.
+    const WELCOME_SHOWN_KEY = 'patchwalk.welcomeShown';
+    if (!context.globalState.get<boolean>(WELCOME_SHOWN_KEY)) {
+        void context.globalState.update(WELCOME_SHOWN_KEY, true);
+        void vscode.window
+            .showInformationMessage(
+                'Patchwalk is running. Point your AI agent at its MCP endpoint and it will explain code changes out loud, right here in your editor.',
+                'Copy MCP endpoint',
+                'Read setup guide',
+            )
+            .then((choice) => {
+                if (choice === 'Copy MCP endpoint') {
+                    void vscode.commands.executeCommand('patchwalk.copyMcpEndpoint');
+                } else if (choice === 'Read setup guide') {
+                    void vscode.env.openExternal(
+                        vscode.Uri.parse('https://github.com/emekaorji/patchwalk#readme'),
+                    );
+                }
+            });
+    }
 
     runInBackground(workerController.start(), 'Failed to start Patchwalk worker');
     runInBackground(

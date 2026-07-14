@@ -129,6 +129,12 @@ export const renderWalkMonitorHtml = (options: WalkMonitorHtmlOptions): string =
     }
     #voices .v-actions button:hover { background: var(--vscode-button-hoverBackground); }
     #voices .v-actions button:disabled { opacity: .5; cursor: default; }
+    #voices .v-soon {
+        font-size: 10px; padding: 2px 7px; border-radius: 10px; white-space: nowrap;
+        color: var(--vscode-descriptionForeground);
+        border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+    }
+    #voices li.unavailable .v-name { opacity: .6; }
 
     /* ---- Daemon ---- */
     #daemonStatus { display: flex; align-items: center; gap: 7px; font-size: 12px; opacity: .9; }
@@ -286,13 +292,22 @@ export const renderWalkMonitorHtml = (options: WalkMonitorHtmlOptions): string =
             list.textContent = '';
             for (const voice of voices.options || []) {
                 const li = document.createElement('li');
-                li.className = voice.id === voices.activeId ? 'active' : '';
+                li.className = [
+                    voice.id === voices.activeId ? 'active' : '',
+                    voice.available === false ? 'unavailable' : '',
+                ].filter(Boolean).join(' ');
                 const name = document.createElement('span');
                 name.className = 'v-name';
                 name.textContent = voice.label + (voice.id === voices.activeId ? '  ✓' : '');
                 const actions = document.createElement('span');
                 actions.className = 'v-actions';
-                if (voice.kind === 'neural' && !voice.installed) {
+                if (voice.available === false) {
+                    // Honest state: advertised, clearly experimental, and NOT clickable.
+                    const soon = document.createElement('span');
+                    soon.className = 'v-soon';
+                    soon.textContent = voice.note || 'Not yet available';
+                    actions.appendChild(soon);
+                } else if (voice.kind === 'neural' && !voice.installed) {
                     const download = document.createElement('button');
                     download.textContent = voice.downloading ? 'Downloading…' : 'Download';
                     download.disabled = voice.downloading;

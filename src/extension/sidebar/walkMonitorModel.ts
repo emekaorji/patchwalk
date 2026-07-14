@@ -41,6 +41,10 @@ export interface WalkMonitorVoiceOption {
     kind: 'system' | 'neural';
     installed: boolean;
     downloading: boolean;
+    /** False → shown as experimental, with the download disabled rather than failing. */
+    available: boolean;
+    /** Why it cannot be installed yet (shown next to the voice). */
+    note?: string;
 }
 
 export interface WalkMonitorVoicesState {

@@ -1,8 +1,8 @@
 {
     "name": "patchwalk",
     "displayName": "Patchwalk",
-    "version": "0.7.0",
-    "description": "Post-patch agentic handoff",
+    "version": "0.1.0",
+    "description": "Hear your AI agent's code changes explained out loud — a spoken, highlighted walkthrough of every patch, right inside your editor.",
     "publisher": "coderabbi",
     "private": true,
     "preview": true,
@@ -11,23 +11,36 @@
         "email": "emekapraiseo@gmail.com",
         "url": "https://github.com/emekaorji"
     },
-    "license": "SEE LICENSE IN LICENSE",
-    "homepage": "https://github.com/emekaorji/patchwalk/blob/master/README.md",
+    "license": "MIT",
+    "homepage": "https://github.com/emekaorji/patchwalk#readme",
     "repository": {
         "type": "git",
-        "url": "https://github.com/emekaorji/patchwalk"
+        "url": "https://github.com/emekaorji/patchwalk.git"
     },
     "bugs": {
         "url": "https://github.com/emekaorji/patchwalk/issues",
         "email": "emekapraiseo@gmail.com"
     },
     "keywords": [
-        "handoff",
+        "ai",
+        "agent",
         "mcp",
+        "voice",
         "narration",
-        "walkthrough"
+        "text-to-speech",
+        "code-review",
+        "walkthrough",
+        "onboarding",
+        "claude",
+        "codex",
+        "copilot",
+        "explain-code",
+        "accessibility"
     ],
     "categories": [
+        "AI",
+        "Education",
+        "Visualization",
         "Other"
     ],
     "main": "./out/src/extension/index.js",
@@ -67,6 +80,10 @@
             {
                 "command": "patchwalk.revealPlayingWindow",
                 "title": "Patchwalk: Reveal Playing Window"
+            },
+            {
+                "command": "patchwalk.copyMcpEndpoint",
+                "title": "Patchwalk: Copy MCP Endpoint"
             }
         ],
         "configuration": {
@@ -156,7 +173,13 @@
                     "name": "Walk Monitor"
                 }
             ]
-        }
+        },
+        "viewsWelcome": [
+            {
+                "view": "patchwalk.walkMonitor",
+                "contents": "No walk has played yet.\n\nPatchwalk speaks a change out loud when your AI agent asks it to. Point your agent at the local Patchwalk daemon, then ask it to walk you through a change.\n\n[Copy MCP endpoint](command:patchwalk.copyMcpEndpoint)\n[Setup guide](https://github.com/emekaorji/patchwalk#readme)\n\nYou can also try it right now with a walk payload on your clipboard:\n[Play walk from clipboard](command:patchwalk.playFromClipboard)"
+            }
+        ]
     },
     "eslintConfig": {
         "extends": "@yutengjing/eslint-config-typescript",
@@ -229,5 +252,10 @@
         "@modelcontextprotocol/sdk": "^1.27.1",
         "ws": "^8.19.0",
         "zod": "^4.3.6"
-    }
+    },
+    "galleryBanner": {
+        "color": "#161B24",
+        "theme": "dark"
+    },
+    "qna": "marketplace"
 }

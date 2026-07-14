@@ -16,6 +16,7 @@ const makeEntry = (files: VoiceCatalogEntry['files']): VoiceCatalogEntry => ({
     id: 'kokoro-en',
     label: 'Kokoro',
     kind: 'neural',
+    available: true,
     family: 'kokoro',
     sizeMB: 90,
     license: 'Apache-2.0',
