@@ -48,3 +48,7 @@ _local/**
 *.handoff.json
 meta.json
 stats.html
+
+# design sources + stray exports (kept in the repo, never shipped)
+*.pen
+image.png

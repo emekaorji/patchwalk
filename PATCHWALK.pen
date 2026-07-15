@@ -1,0 +1,108 @@
+{
+  "version": "2.14",
+  "children": [
+    {
+      "type": "frame",
+      "id": "bi8Au",
+      "x": 0,
+      "y": 0,
+      "name": "Frame",
+      "clip": true,
+      "width": 800,
+      "height": 600,
+      "fill": "#FFFFFF",
+      "layout": "none"
+    },
+    {
+      "type": "frame",
+      "id": "K9LQG",
+      "x": 920,
+      "y": 0,
+      "name": "Icon / Patchwalk 256",
+      "clip": true,
+      "width": 256,
+      "height": 256,
+      "fill": {
+        "type": "gradient",
+        "gradientType": "radial",
+        "enabled": true,
+        "rotation": 0,
+        "size": {
+          "width": 1,
+          "height": 1
+        },
+        "colors": [
+          {
+            "color": "#1E2735",
+            "position": 0
+          },
+          {
+            "color": "#161B24",
+            "position": 1
+          }
+        ]
+      },
+      "cornerRadius": 56,
+      "layout": "none",
+      "children": [
+        {
+          "type": "rectangle",
+          "cornerRadius": 13,
+          "id": "Iqd21",
+          "x": 120,
+          "y": 62,
+          "name": "Context line top",
+          "fill": "#3A4351",
+          "width": 92,
+          "height": 26
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": 13,
+          "id": "Jzks6",
+          "x": 120,
+          "y": 166,
+          "name": "Context line bottom",
+          "fill": "#3A4351",
+          "width": 76,
+          "height": 26
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": 22,
+          "id": "FTD3V",
+          "x": 120,
+          "y": 104,
+          "name": "Active line",
+          "fill": "#E5A50A",
+          "width": 104,
+          "height": 44,
+          "effect": {
+            "type": "shadow",
+            "shadowType": "outer",
+            "color": "#E5A50A55",
+            "blur": 18
+          }
+        },
+        {
+          "type": "path",
+          "id": "NsQwT",
+          "x": 38,
+          "y": 84,
+          "name": "Play triangle",
+          "geometry": "M16.7 9.5l68.6 35q10.7 5.5 0 11l-68.6 35q-10.7 5.5-10.7-6.5l0-68q0-12 10.7-6.5z",
+          "viewBox": [
+            0,
+            0,
+            100,
+            100
+          ],
+          "fill": "#E5A50A",
+          "width": 66,
+          "height": 84
+        }
+      ]
+    }
+  ],
+  "fileToken": "dbf36505-d897-49a3-b435-7130d0b7b577"
+}
