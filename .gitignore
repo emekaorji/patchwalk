@@ -14,3 +14,4 @@ daemon-walk.handoff.json
 
 # stray icon export hand-offs
 /image.png
+.env*

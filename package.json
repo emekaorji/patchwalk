@@ -5,7 +5,7 @@
     "description": "Narrate your codebase in natural language. Works with any agent that supports MCP.",
     "publisher": "coderabbi",
     "private": true,
-    "preview": true,
+    "preview": false,
     "author": {
         "name": "emekaorji",
         "email": "emekapraiseo@gmail.com",
