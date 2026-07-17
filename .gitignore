@@ -7,3 +7,11 @@ node_modules
 # esbuild-visualizer
 meta.json
 stats.html
+_local*
+
+# sample walk payloads produced while testing
+daemon-walk.handoff.json
+
+# stray icon export hand-offs
+/image.png
+.env*

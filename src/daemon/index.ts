@@ -37,6 +37,17 @@ const main = async (): Promise<void> => {
     // Create the singleton daemon for this process and then keep Node alive on the HTTP listener.
     const server = new PatchwalkMcpServer({
         port: daemonPort,
+        // No editor windows for a while → nothing to serve. Exit rather than linger on the user's
+        // machine. Any window that comes back simply respawns the daemon on demand.
+        onIdleShutdown: () => {
+            logger.info('Patchwalk daemon exiting after an idle period with no editor windows.');
+            // The daemon IS a standalone CLI process, and exiting is precisely the point: it must
+            // not linger on the user's machine once no editor windows are left.
+            void logger.close().finally(() => {
+                // eslint-disable-next-line unicorn/no-process-exit
+                process.exit(0);
+            });
+        },
     });
 
     let stopPromise: Promise<void> | undefined;
@@ -76,7 +87,11 @@ const main = async (): Promise<void> => {
     });
 };
 
-main().catch((error) => {
+main().catch(async (error) => {
+    // Route the failure to the file log too — the daemon is spawned with stdio ignored, so a
+    // console-only error would vanish and leave a dead daemon with no diagnostic trail (P7).
+    logger.error('Patchwalk daemon crashed during bootstrap.', error);
     console.error(error);
+    await logger.close();
     process.exitCode = 1;
 });

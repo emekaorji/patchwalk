@@ -8,26 +8,34 @@ import process from 'node:process';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import WebSocket, { WebSocketServer } from 'ws';
 import { z } from 'zod';
 
 import type {
-    PatchwalkWorkerEvent,
-    PatchwalkWorkerHeartbeat,
-    PatchwalkWorkerRegistration,
+    PatchwalkDaemonToWorkerMessage,
+    PatchwalkPlaybackFailedMessage,
+    PatchwalkPlaybackProgressMessage,
+    PatchwalkPlaybackReadyMessage,
+    PatchwalkPlaybackStartedMessage,
+    PatchwalkPlaybackState,
+    PatchwalkWalkOwnerMessage,
+    PatchwalkWorkerHeartbeatMessage,
+    PatchwalkWorkerRegisterMessage,
+    PatchwalkWorkerUpdateMessage,
 } from '../lib/controlProtocol';
 import {
-    PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS,
-    PATCHWALK_DEFAULT_POLL_INTERVAL_MS,
-    patchwalkWorkerClaimSchema,
-    patchwalkWorkerHeartbeatSchema,
-    patchwalkWorkerRegistrationResponseSchema,
-    patchwalkWorkerRegistrationSchema,
-    patchwalkWorkerResultSchema,
+    PATCHWALK_DEFAULT_READY_TIMEOUT_MS,
+    PATCHWALK_DEFAULT_STOP_TIMEOUT_MS,
+    PATCHWALK_WORKER_SOCKET_PATH,
+    patchwalkWorkerToDaemonMessageSchema,
 } from '../lib/controlProtocol';
 import * as logger from '../lib/logger';
 import type {
+    PatchwalkActiveHandoffStatusResource,
     PatchwalkDispatchStatusResource,
     PatchwalkStatusResource,
+    PatchwalkStatusResult,
+    PatchwalkStopResult,
     PatchwalkWorkerStatusResource,
 } from '../lib/mcpCatalog';
 import {
@@ -35,35 +43,41 @@ import {
     createPatchwalkComposePromptText,
     createPatchwalkExampleHandoff,
     createPatchwalkExpandWalkthroughPromptText,
+    createPatchwalkOnboardingPromptText,
     createPatchwalkOperatorManual,
-    normalizePatchwalkPlayPayload,
+    createPatchwalkPlayInputShape,
+    createPatchwalkPlayPayloadSchema,
+    createPatchwalkPlayToolDescription,
     PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
     PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
+    PATCHWALK_COMPOSE_ONBOARDING_PROMPT_NAME,
     PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
     PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME,
     PATCHWALK_MCP_SERVER_INFO,
     PATCHWALK_OPERATOR_MANUAL_RESOURCE_URI,
     PATCHWALK_PLAY_TOOL_NAME,
     PATCHWALK_STATUS_RESOURCE_URI,
-    patchwalkPlayArgumentsSchema,
-    patchwalkPlayResultSchema,
+    PATCHWALK_STATUS_TOOL_NAME,
+    PATCHWALK_STOP_TOOL_NAME,
+    patchwalkPlayResultShape,
+    patchwalkStatusResultShape,
+    patchwalkStopResultSchema,
+    patchwalkStopResultShape,
 } from '../lib/mcpCatalog';
 import { normalizeAbsolutePath } from '../lib/pathUtils';
-import type { PatchwalkWorkerClaimSummary } from '../lib/routing';
-import { compareWorkerClaims } from '../lib/routing';
-import type { PatchwalkHandoffPayload } from '../lib/schema';
+import type { PatchwalkWorkerRoutingCandidate } from '../lib/routing';
+import { compareWorkerRoutingCandidates, matchBasePathToWorkspaceRoots } from '../lib/routing';
+import type { PatchwalkHandoffPayload, PatchwalkNarrationStyle } from '../lib/schema';
+import { formatPatchwalkValidationIssues, PATCHWALK_DEFAULT_NARRATION_STYLE } from '../lib/schema';
 
-/**
- * The daemon owns two related protocols:
- *
- * 1. The public MCP surface exposed to AI clients
- * 2. The private worker-control API used by live editor windows
- *
- * This file intentionally keeps both in one place because dispatch routing needs full visibility
- * into MCP calls, registered workers, and playback completion signals.
- */
 interface PatchwalkMcpServerOptions {
     port: number;
+    /** Called when the daemon has had no editor windows for IDLE_SHUTDOWN_MS and should exit. */
+    onIdleShutdown?: () => void;
+    /** Override the idle window (tests). */
+    idleShutdownMs?: number;
+    /** Override how often idleness is checked (tests). */
+    idleCheckIntervalMs?: number;
 }
 
 interface JsonRpcErrorResponse {
@@ -84,12 +98,6 @@ interface PatchwalkMcpSession {
     transport: StreamableHTTPServerTransport;
 }
 
-interface PendingWorkerPoll {
-    resolve: (events: PatchwalkWorkerEvent[]) => void;
-    timeout: NodeJS.Timeout;
-}
-
-// Workers are tracked entirely in-memory because live windows can always re-register after reconnects.
 interface RegisteredWorker {
     workerId: string;
     processId: number;
@@ -98,46 +106,52 @@ interface RegisteredWorker {
     registeredAt: string;
     registeredSequence: number;
     lastSeenAt: string;
-    pendingEvents: PatchwalkWorkerEvent[];
-    pendingPoll?: PendingWorkerPoll;
+    connectionState: 'connected';
+    playbackState: PatchwalkPlaybackState;
+    activeHandoffId: string | null;
+    socket: WebSocket;
 }
 
-// Dispatch results are normalized before they are returned to the MCP tool caller.
-interface DispatchExecutionResult {
+interface DispatchLaunchResult {
     workerId: string;
     matchedRoot: string;
-    handoffId: string;
-    stepsPlayed: number;
+    walkId: string;
+    stepCount: number;
 }
 
 interface ActiveDispatch {
     dispatchId: string;
+    walkId: string;
     payload: PatchwalkHandoffPayload;
     createdAt: string;
-    state: 'claiming' | 'executing';
-    claims: PatchwalkWorkerClaimSummary[];
+    state: 'preparing' | 'executing' | 'playing' | 'stopping';
     selectedWorkerId?: string;
     selectedMatchedRoot?: string;
-    resultPromise: Promise<DispatchExecutionResult>;
-    resolveResult: (value: DispatchExecutionResult) => void;
-    rejectResult: (error: Error) => void;
+    stepCount?: number;
+    currentStepIndex?: number;
+    /** Transient per-attempt handshake resolvers (positive acks replace silence-means-success). */
+    readyResolve?: () => void;
+    readyReject?: (error: Error) => void;
+    startedResolve?: (stepCount: number) => void;
+    startedReject?: (error: Error) => void;
+    stopAcknowledgeResolve?: () => void;
+    stopAcknowledgeReject?: (error: Error) => void;
 }
 
 const HEALTH_PATH = '/health';
+const STATUS_PATH = '/status';
 const MCP_PATH = '/mcp';
-const WORKERS_PATH = '/workers';
 const DAEMON_SHUTDOWN_PATH = '/daemon/shutdown';
 const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
-const DEFAULT_LONG_POLL_TIMEOUT_MS = 25_000;
-const MAX_LONG_POLL_TIMEOUT_MS = 30_000;
-// The claim window is short so MCP callers do not pay a large routing penalty.
-const CLAIM_WINDOW_MS = 600;
-const EXECUTION_TIMEOUT_MS = 5 * 60_000;
 const STALE_WORKER_TIMEOUT_MS = 20_000;
-
 /**
- * MCP transport helpers stay local so protocol failures never leak raw implementation details.
+ * The daemon exists to serve editor windows. When the last one goes away it has nothing to do, so
+ * it must NOT linger: a detached process that outlives the editor (and survives an uninstall) is
+ * exactly the kind of thing users find running on their machine weeks later and rightly resent.
  */
+const IDLE_SHUTDOWN_MS = 5 * 60_000;
+const IDLE_CHECK_INTERVAL_MS = 30_000;
+
 const createJsonRpcErrorResponse = (
     code: number,
     message: string,
@@ -154,7 +168,6 @@ const createJsonRpcErrorResponse = (
 };
 
 const getRequestUrl = (request: IncomingMessage): URL => {
-    // Request URLs are resolved against localhost because the daemon only serves local traffic.
     return new URL(request.url ?? '/', 'http://127.0.0.1');
 };
 
@@ -163,18 +176,28 @@ const getRequestPath = (request: IncomingMessage): string => {
 };
 
 const getSessionId = (request: IncomingMessage): string | undefined => {
-    // MCP session ids travel in a header after initialize negotiates them with the SDK transport.
     const headerValue = request.headers['mcp-session-id'];
     return typeof headerValue === 'string' && headerValue.length > 0 ? headerValue : undefined;
 };
 
-/**
- * Claim windows are short on purpose so one routed playback still feels immediate.
- */
-const createDelay = (durationMs: number): Promise<void> => {
-    return new Promise((resolve) => {
-        setTimeout(resolve, durationMs);
+const createTimeoutError = (message: string): Error => {
+    const timeoutError = new Error(message);
+    timeoutError.name = 'TimeoutError';
+    return timeoutError;
+};
+
+const withTimeout = async <T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    message: string,
+): Promise<T> => {
+    const timeoutPromise = new Promise<T>((_resolve, reject) => {
+        setTimeout(() => {
+            reject(createTimeoutError(message));
+        }, timeoutMs);
     });
+
+    return Promise.race([promise, timeoutPromise]);
 };
 
 const patchwalkComposePromptArgsSchema = {
@@ -198,28 +221,18 @@ const patchwalkExpandWalkthroughPromptArgsSchema = {
         .describe('Optional detail preference such as concise, detailed, or exhaustive.'),
 };
 
-const createTimeoutError = (message: string): Error => {
-    const timeoutError = new Error(message);
-    timeoutError.name = 'TimeoutError';
-    return timeoutError;
-};
-
-const withTimeout = async <T>(
-    promise: Promise<T>,
-    timeoutMs: number,
-    message: string,
-): Promise<T> => {
-    const timeoutPromise = new Promise<T>((_resolve, reject) => {
-        setTimeout(() => {
-            reject(createTimeoutError(message));
-        }, timeoutMs);
-    });
-
-    return Promise.race([promise, timeoutPromise]);
+const patchwalkOnboardingPromptArgsSchema = {
+    codebasePath: z
+        .string()
+        .describe('Absolute path to the codebase root; used as the walk basePath.'),
+    area: z.string().optional().describe('Optional subsystem or area to focus the onboarding on.'),
+    depth: z
+        .string()
+        .optional()
+        .describe('Optional depth, e.g. "quick tour" or "in-depth guided walk".'),
 };
 
 const normalizeWorkspaceRoots = async (workspaceRoots: string[]): Promise<string[]> => {
-    // Worker roots are normalized up front so routing never depends on symlinks or trailing slashes.
     const normalizedRoots = await Promise.all(
         workspaceRoots.map((workspaceRoot) => normalizeAbsolutePath(workspaceRoot)),
     );
@@ -228,32 +241,28 @@ const normalizeWorkspaceRoots = async (workspaceRoots: string[]): Promise<string
     );
 };
 
-/**
- * Worker sub-routes all follow /workers/:workerId/:action.
- */
-const getWorkerPathParts = (requestPath: string): string[] | undefined => {
-    if (!requestPath.startsWith(`${WORKERS_PATH}/`)) {
-        return undefined;
-    }
-
-    return requestPath
-        .slice(WORKERS_PATH.length + 1)
-        .split('/')
-        .filter(Boolean);
-};
-
 export class PatchwalkMcpServer {
     private server: Server | undefined;
+    private workerSocketServer: WebSocketServer | undefined;
     private readonly sessions = new Map<string, PatchwalkMcpSession>();
     private readonly workers = new Map<string, RegisteredWorker>();
-    private readonly activeDispatches = new Map<string, ActiveDispatch>();
     private workerSequence = 0;
     private startedAt: string | null = null;
+    private activeDispatch: ActiveDispatch | undefined;
+    /**
+     * The narration style the daemon hands to authoring agents. It is MACHINE-WIDE (the VS Code
+     * setting is `scope: "application"`, so every window reports the same value) and reaches the
+     * daemon over the worker socket. New MCP sessions pick up the current style; a session already
+     * open keeps the tool schema it was created with, so an agent sees a consistent contract.
+     */
+    private narrationStyle: PatchwalkNarrationStyle = PATCHWALK_DEFAULT_NARRATION_STYLE;
+    private idleTimer: NodeJS.Timeout | undefined;
+    /** When the last worker disconnected, or null while at least one window is attached. */
+    private idleSince: number | null = null;
 
     public constructor(private readonly options: PatchwalkMcpServerOptions) {}
 
     public get endpointUrl(): string | undefined {
-        // Expose the resolved port because tests may boot the daemon on an ephemeral port.
         const port = this.listeningPort;
         if (port === undefined) {
             return undefined;
@@ -263,7 +272,6 @@ export class PatchwalkMcpServer {
     }
 
     public get listeningPort(): number | undefined {
-        // Node returns either a pipe string or an address object; Patchwalk only uses TCP.
         const address = this.server?.address();
         if (!address || typeof address === 'string') {
             return undefined;
@@ -278,14 +286,35 @@ export class PatchwalkMcpServer {
 
     public async start(): Promise<void> {
         if (this.server) {
-            // Starting twice is harmless and keeps daemon recovery idempotent.
             logger.info('Patchwalk daemon start skipped because the server is already running.');
             return;
         }
 
-        // One HTTP server handles MCP and worker traffic so both sides share runtime state.
+        this.workerSocketServer = new WebSocketServer({
+            noServer: true,
+        });
+
         this.server = createServer(async (request, response) => {
             await this.handleHttpRequestSafely(request, response);
+        });
+
+        this.server.on('upgrade', (request, socket, head) => {
+            if (
+                getRequestPath(request) !== PATCHWALK_WORKER_SOCKET_PATH ||
+                !this.workerSocketServer
+            ) {
+                socket.destroy();
+                return;
+            }
+
+            this.workerSocketServer.handleUpgrade(
+                request,
+                socket,
+                head,
+                (workerSocket: WebSocket) => {
+                    this.handleWorkerSocket(workerSocket);
+                },
+            );
         });
 
         await new Promise<void>((resolve, reject) => {
@@ -302,6 +331,7 @@ export class PatchwalkMcpServer {
         });
 
         this.startedAt = new Date().toISOString();
+        this.startIdleWatchdog();
         logger.info('Patchwalk daemon server started.', {
             listeningPort: this.listeningPort ?? this.options.port,
             endpointUrl: this.endpointUrl ?? null,
@@ -310,22 +340,28 @@ export class PatchwalkMcpServer {
 
     public async stop(): Promise<void> {
         logger.info('Patchwalk daemon server shutdown started.');
-        // Stop sessions, workers, and in-flight dispatches in that order so callers fail deterministically.
+        if (this.idleTimer) {
+            clearInterval(this.idleTimer);
+            this.idleTimer = undefined;
+        }
         const sessionIds = [...this.sessions.keys()];
         await Promise.allSettled(sessionIds.map((sessionId) => this.disposeSession(sessionId)));
 
-        const workers = [...this.workers.values()];
-        for (const worker of workers) {
-            this.disposeWorker(worker.workerId);
+        if (this.activeDispatch) {
+            const shutdownError = new Error('Patchwalk daemon stopped before the walk completed.');
+            this.activeDispatch.readyReject?.(shutdownError);
+            this.activeDispatch.startedReject?.(shutdownError);
+            this.activeDispatch.stopAcknowledgeReject?.(shutdownError);
+            this.activeDispatch = undefined;
         }
 
-        const dispatches = [...this.activeDispatches.values()];
-        for (const dispatch of dispatches) {
-            dispatch.rejectResult(
-                new Error('Patchwalk daemon stopped before the dispatch completed.'),
-            );
-            this.activeDispatches.delete(dispatch.dispatchId);
+        for (const worker of this.workers.values()) {
+            worker.socket.close();
         }
+        this.workers.clear();
+
+        this.workerSocketServer?.close();
+        this.workerSocketServer = undefined;
 
         if (!this.server) {
             this.startedAt = null;
@@ -356,9 +392,15 @@ export class PatchwalkMcpServer {
         const method = request.method ?? 'UNKNOWN';
         const requestPath = getRequestPath(request);
         const requestStartedAt = Date.now();
+        const isOauthDiscoveryPath =
+            requestPath === '/.well-known/oauth-authorization-server/mcp' ||
+            requestPath === '/mcp/.well-known/oauth-authorization-server' ||
+            requestPath === '/.well-known/oauth-authorization-server';
         const shouldLogRequest =
             requestPath !== HEALTH_PATH &&
-            !(requestPath.startsWith(`${WORKERS_PATH}/`) && requestPath.endsWith('/events'));
+            requestPath !== STATUS_PATH &&
+            requestPath !== MCP_PATH &&
+            !isOauthDiscoveryPath;
 
         if (shouldLogRequest) {
             logger.info('Incoming daemon HTTP request.', {
@@ -378,7 +420,6 @@ export class PatchwalkMcpServer {
         try {
             await this.handleHttpRequest(request, response);
         } catch (error) {
-            // The daemon always prefers a structured failure response over a hung connection.
             if (!response.headersSent) {
                 this.writeJsonResponse(
                     response,
@@ -407,23 +448,28 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
-        // Opportunistic pruning keeps the registry honest without a separate cleanup loop.
         this.pruneStaleWorkers();
 
         const requestPath = getRequestPath(request);
 
         if (request.method === 'GET' && requestPath === HEALTH_PATH) {
-            // Health is intentionally tiny and does not require MCP negotiation.
             this.writeJsonResponse(response, 200, {
                 ok: true,
                 serverKind: 'patchwalk-daemon',
                 apiVersion: '1.0.0',
+                workerTransport: 'websocket',
+                workerSocketPath: PATCHWALK_WORKER_SOCKET_PATH,
                 endpointUrl: this.endpointUrl ?? null,
                 daemonPid: process.pid,
                 activeSessionCount: this.activeSessionCount,
                 workerCount: this.workers.size,
-                activeDispatchCount: this.activeDispatches.size,
+                activeDispatchCount: this.activeDispatch ? 1 : 0,
             });
+            return;
+        }
+
+        if (request.method === 'GET' && requestPath === STATUS_PATH) {
+            this.writeJsonResponse(response, 200, this.createStatusResource());
             return;
         }
 
@@ -435,7 +481,6 @@ export class PatchwalkMcpServer {
             });
 
             setImmediate(() => {
-                // Respond first so callers do not race the process shutdown path.
                 this.stop().catch((error: unknown) => {
                     logger.error('Daemon shutdown endpoint failed to stop the server.', error);
                     console.error(error);
@@ -449,17 +494,6 @@ export class PatchwalkMcpServer {
             return;
         }
 
-        if (requestPath === WORKERS_PATH && request.method === 'POST') {
-            // Worker registration is a plain local HTTP endpoint, not an MCP tool.
-            await this.handleWorkerRegistration(request, response);
-            return;
-        }
-
-        if (requestPath.startsWith(`${WORKERS_PATH}/`)) {
-            await this.handleWorkerRequest(request, response);
-            return;
-        }
-
         this.writeJsonResponse(response, 404, { error: 'Not found' });
     }
 
@@ -467,7 +501,6 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
-        // Streamable HTTP uses POST for messages and GET/DELETE for session lifecycle.
         switch (request.method) {
             case 'POST':
                 await this.handlePostRequest(request, response);
@@ -487,259 +520,10 @@ export class PatchwalkMcpServer {
         }
     }
 
-    private async handleWorkerRegistration(
-        request: IncomingMessage,
-        response: ServerResponse,
-    ): Promise<void> {
-        // Registration is validated before any worker touches the daemon registry.
-        const parsedBody = patchwalkWorkerRegistrationSchema.safeParse(
-            await this.readJsonBody(request),
-        );
-        if (!parsedBody.success) {
-            logger.warn('Worker registration rejected because the payload was invalid.', {
-                reason:
-                    parsedBody.error.issues[0]?.message ?? 'Invalid worker registration payload.',
-            });
-            this.writeJsonResponse(response, 400, {
-                error:
-                    parsedBody.error.issues[0]?.message ?? 'Invalid worker registration payload.',
-            });
-            return;
-        }
-
-        const normalizedRegistration = await this.normalizeWorkerRegistration(parsedBody.data);
-        const registeredWorker = this.upsertWorker(normalizedRegistration);
-
-        // The daemon publishes cadence so workers do not hardcode lifecycle assumptions.
-        const registrationResponse = patchwalkWorkerRegistrationResponseSchema.parse({
-            workerId: registeredWorker.workerId,
-            daemonPid: process.pid,
-            pollIntervalMs: PATCHWALK_DEFAULT_POLL_INTERVAL_MS,
-            heartbeatIntervalMs: PATCHWALK_DEFAULT_HEARTBEAT_INTERVAL_MS,
-        });
-        logger.info('Worker registration accepted.', {
-            workerId: registeredWorker.workerId,
-            processId: registeredWorker.processId,
-            workspaceRootCount: registeredWorker.workspaceRoots.length,
-        });
-        this.writeJsonResponse(response, 200, registrationResponse);
-    }
-
-    private async handleWorkerRequest(
-        request: IncomingMessage,
-        response: ServerResponse,
-    ): Promise<void> {
-        // Worker routes are intentionally narrow so the private protocol stays easy to audit.
-        const pathParts = getWorkerPathParts(getRequestPath(request));
-        if (!pathParts || pathParts.length !== 2) {
-            this.writeJsonResponse(response, 404, { error: 'Unknown worker endpoint.' });
-            return;
-        }
-
-        const [workerId, action] = pathParts;
-        const worker = this.workers.get(workerId);
-        if (!worker) {
-            this.writeJsonResponse(response, 404, { error: 'Worker not registered.' });
-            return;
-        }
-
-        switch (action) {
-            case 'heartbeat':
-                if (request.method !== 'POST') {
-                    this.writeJsonResponse(response, 405, { error: 'Method not allowed.' });
-                    return;
-                }
-
-                await this.handleWorkerHeartbeat(worker, request, response);
-                return;
-            case 'events':
-                if (request.method !== 'GET') {
-                    this.writeJsonResponse(response, 405, { error: 'Method not allowed.' });
-                    return;
-                }
-
-                await this.handleWorkerEvents(worker, request, response);
-                return;
-            case 'claims':
-                if (request.method !== 'POST') {
-                    this.writeJsonResponse(response, 405, { error: 'Method not allowed.' });
-                    return;
-                }
-
-                await this.handleWorkerClaim(worker, request, response);
-                return;
-            case 'results':
-                if (request.method !== 'POST') {
-                    this.writeJsonResponse(response, 405, { error: 'Method not allowed.' });
-                    return;
-                }
-
-                await this.handleWorkerResult(worker, request, response);
-                return;
-            default:
-                this.writeJsonResponse(response, 404, { error: 'Unknown worker endpoint.' });
-                return;
-        }
-    }
-
-    private async handleWorkerHeartbeat(
-        worker: RegisteredWorker,
-        request: IncomingMessage,
-        response: ServerResponse,
-    ): Promise<void> {
-        // Heartbeats double as workspace-root refreshes for already-registered windows.
-        const parsedBody = patchwalkWorkerHeartbeatSchema.safeParse(
-            await this.readJsonBody(request),
-        );
-        if (!parsedBody.success) {
-            logger.warn('Worker heartbeat rejected because the payload was invalid.', {
-                workerId: worker.workerId,
-                reason: parsedBody.error.issues[0]?.message ?? 'Invalid worker heartbeat payload.',
-            });
-            this.writeJsonResponse(response, 400, {
-                error: parsedBody.error.issues[0]?.message ?? 'Invalid worker heartbeat payload.',
-            });
-            return;
-        }
-
-        const heartbeat = await this.normalizeWorkerHeartbeat(parsedBody.data);
-        // Workers can add or remove workspace roots during their lifetime.
-        worker.workspaceRoots = heartbeat.workspaceRoots;
-        worker.lastSeenAt = heartbeat.lastSeenAt;
-
-        this.writeJsonResponse(response, 200, { ok: true });
-    }
-
-    private async handleWorkerEvents(
-        worker: RegisteredWorker,
-        request: IncomingMessage,
-        response: ServerResponse,
-    ): Promise<void> {
-        // Workers are allowed to suggest a wait time, but the daemon clamps it to sane bounds.
-        const waitMsValue = Number(getRequestUrl(request).searchParams.get('waitMs') ?? '');
-        const waitMs = Number.isFinite(waitMsValue)
-            ? Math.min(Math.max(waitMsValue, 1), MAX_LONG_POLL_TIMEOUT_MS)
-            : DEFAULT_LONG_POLL_TIMEOUT_MS;
-
-        const events = await this.waitForWorkerEvents(worker, waitMs);
-        this.writeJsonResponse(response, 200, {
-            events,
-            pollIntervalMs: PATCHWALK_DEFAULT_POLL_INTERVAL_MS,
-        });
-    }
-
-    private async handleWorkerClaim(
-        worker: RegisteredWorker,
-        request: IncomingMessage,
-        response: ServerResponse,
-    ): Promise<void> {
-        // Claims arrive during the short claim window after a playback request is broadcast.
-        const parsedBody = patchwalkWorkerClaimSchema.safeParse(await this.readJsonBody(request));
-        if (!parsedBody.success) {
-            logger.warn('Worker claim rejected because the payload was invalid.', {
-                workerId: worker.workerId,
-                reason: parsedBody.error.issues[0]?.message ?? 'Invalid worker claim payload.',
-            });
-            this.writeJsonResponse(response, 400, {
-                error: parsedBody.error.issues[0]?.message ?? 'Invalid worker claim payload.',
-            });
-            return;
-        }
-
-        const claim = parsedBody.data;
-        const dispatch = this.activeDispatches.get(claim.dispatchId);
-        if (!dispatch || dispatch.state !== 'claiming' || !claim.accepted) {
-            // Late or rejected claims are not fatal; they simply miss the claim window.
-            this.writeJsonResponse(response, 202, { ok: true });
-            return;
-        }
-
-        // One worker can refresh its claim while the window is still open, so replace by worker id.
-        dispatch.claims = [
-            ...dispatch.claims.filter(
-                (existingClaim) => existingClaim.workerId !== worker.workerId,
-            ),
-            {
-                workerId: worker.workerId,
-                matchedRoot: claim.matchedRoot!,
-                matchKind: claim.matchKind!,
-                registeredSequence: worker.registeredSequence,
-            },
-        ];
-
-        logger.info('Worker claim accepted for active dispatch.', {
-            workerId: worker.workerId,
-            dispatchId: dispatch.dispatchId,
-            matchKind: claim.matchKind,
-            matchedRoot: claim.matchedRoot,
-        });
-
-        this.writeJsonResponse(response, 202, { ok: true });
-    }
-
-    private async handleWorkerResult(
-        worker: RegisteredWorker,
-        request: IncomingMessage,
-        response: ServerResponse,
-    ): Promise<void> {
-        // Results arrive only from the single selected worker once playback succeeds or fails.
-        const parsedBody = patchwalkWorkerResultSchema.safeParse(await this.readJsonBody(request));
-        if (!parsedBody.success) {
-            logger.warn('Worker result rejected because the payload was invalid.', {
-                workerId: worker.workerId,
-                reason: parsedBody.error.issues[0]?.message ?? 'Invalid worker result payload.',
-            });
-            this.writeJsonResponse(response, 400, {
-                error: parsedBody.error.issues[0]?.message ?? 'Invalid worker result payload.',
-            });
-            return;
-        }
-
-        const result = parsedBody.data;
-        const dispatch = this.activeDispatches.get(result.dispatchId);
-        if (!dispatch || dispatch.selectedWorkerId !== worker.workerId) {
-            logger.warn('Worker result rejected because no matching active dispatch was found.', {
-                workerId: worker.workerId,
-                dispatchId: result.dispatchId,
-            });
-            this.writeJsonResponse(response, 404, {
-                error: 'Dispatch not found for worker result.',
-            });
-            return;
-        }
-
-        // Results are the handoff between editor-side playback and the MCP tool response.
-        if (result.status === 'completed') {
-            logger.info('Worker reported completed playback.', {
-                workerId: worker.workerId,
-                dispatchId: result.dispatchId,
-                handoffId: result.handoffId,
-                stepsPlayed: result.stepsPlayed,
-            });
-            dispatch.resolveResult({
-                workerId: worker.workerId,
-                matchedRoot: dispatch.selectedMatchedRoot ?? dispatch.payload.basePath,
-                handoffId: result.handoffId,
-                stepsPlayed: result.stepsPlayed!,
-            });
-        } else {
-            logger.error('Worker reported failed playback.', {
-                workerId: worker.workerId,
-                dispatchId: result.dispatchId,
-                handoffId: result.handoffId,
-                error: result.error,
-            });
-            dispatch.rejectResult(new Error(result.error));
-        }
-
-        this.writeJsonResponse(response, 202, { ok: true });
-    }
-
     private async handlePostRequest(
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
-        // POST is the only MCP route that can create sessions and deliver client messages.
         let parsedBody: unknown;
         try {
             parsedBody = await this.readJsonBody(request);
@@ -761,9 +545,6 @@ export class PatchwalkMcpServer {
         if (sessionId) {
             const session = this.sessions.get(sessionId);
             if (!session) {
-                logger.warn('Rejected MCP POST request because the session id was unknown.', {
-                    sessionId,
-                });
                 this.writeJsonResponse(
                     response,
                     400,
@@ -778,8 +559,6 @@ export class PatchwalkMcpServer {
         }
 
         if (!isInitializeRequest(parsedBody)) {
-            // Clients must initialize before making any session-bound MCP requests.
-            logger.warn('Rejected MCP POST request because initialize was not called first.');
             this.writeJsonResponse(
                 response,
                 400,
@@ -792,7 +571,6 @@ export class PatchwalkMcpServer {
         session.requestCount += 1;
         await this.forwardToTransport(session, request, response, parsedBody);
 
-        // Initialization can fail before the SDK assigns a session id.
         if (!session.id) {
             await this.disposeOrphanedSession(session);
         }
@@ -802,10 +580,8 @@ export class PatchwalkMcpServer {
         request: IncomingMessage,
         response: ServerResponse,
     ): Promise<void> {
-        // GET and DELETE requests are meaningful only after a session already exists.
         const sessionId = getSessionId(request);
         if (!sessionId) {
-            logger.warn('Rejected MCP session-bound request without a session id header.');
             this.writeJsonResponse(
                 response,
                 400,
@@ -816,9 +592,6 @@ export class PatchwalkMcpServer {
 
         const session = this.sessions.get(sessionId);
         if (!session) {
-            logger.warn('Rejected MCP session-bound request with an unknown session id.', {
-                sessionId,
-            });
             this.writeJsonResponse(
                 response,
                 400,
@@ -840,7 +613,6 @@ export class PatchwalkMcpServer {
         try {
             await session.transport.handleRequest(request, response, parsedBody);
         } catch {
-            // Keep SDK transport failures inside the daemon boundary.
             logger.error('MCP transport failed to handle a request.', {
                 sessionId: session.id || null,
                 method: request.method ?? 'UNKNOWN',
@@ -857,7 +629,6 @@ export class PatchwalkMcpServer {
     }
 
     private async createSession(): Promise<PatchwalkMcpSession> {
-        // Session setup is slightly circular because the transport provides the id after initialize.
         const sessionRef: {
             current: PatchwalkMcpSession | undefined;
         } = {
@@ -871,7 +642,6 @@ export class PatchwalkMcpServer {
                     return;
                 }
 
-                // Session ids are only known after the transport finishes initialize negotiation.
                 sessionRef.current.id = sessionId;
                 this.sessions.set(sessionId, sessionRef.current);
                 logger.info('MCP session initialized.', {
@@ -903,7 +673,10 @@ export class PatchwalkMcpServer {
     }
 
     private createMcpServer(getSession: () => PatchwalkMcpSession | undefined): McpServer {
-        // Each MCP session gets its own SDK server instance, but all instances share daemon state.
+        // The tool contract is built from the style ACTIVE WHEN THE SESSION IS CREATED, so an agent
+        // always sees a self-consistent schema + description + guide + prompts for one connection.
+        const sessionStyle = this.narrationStyle;
+
         const server = new McpServer(PATCHWALK_MCP_SERVER_INFO, {
             capabilities: {
                 logging: {},
@@ -920,7 +693,6 @@ export class PatchwalkMcpServer {
                 mimeType: 'application/json',
             },
             async () => {
-                // Status is generated live so it reflects current workers and dispatches.
                 return {
                     contents: [
                         {
@@ -969,7 +741,7 @@ export class PatchwalkMcpServer {
                         {
                             uri: PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
                             mimeType: 'application/json',
-                            text: `${JSON.stringify(createPatchwalkExampleHandoff(), null, 2)}\n`,
+                            text: `${JSON.stringify(createPatchwalkExampleHandoff(sessionStyle), null, 2)}\n`,
                         },
                     ],
                 };
@@ -990,7 +762,7 @@ export class PatchwalkMcpServer {
                         {
                             uri: PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
                             mimeType: 'text/markdown',
-                            text: `${createPatchwalkAuthoringGuide()}\n`,
+                            text: `${createPatchwalkAuthoringGuide(sessionStyle)}\n`,
                         },
                     ],
                 };
@@ -1012,7 +784,7 @@ export class PatchwalkMcpServer {
                             role: 'user' as const,
                             content: {
                                 type: 'text' as const,
-                                text: createPatchwalkComposePromptText(args),
+                                text: createPatchwalkComposePromptText(args, sessionStyle),
                             },
                         },
                     ],
@@ -1035,7 +807,33 @@ export class PatchwalkMcpServer {
                             role: 'user' as const,
                             content: {
                                 type: 'text' as const,
-                                text: createPatchwalkExpandWalkthroughPromptText(args),
+                                text: createPatchwalkExpandWalkthroughPromptText(
+                                    args,
+                                    sessionStyle,
+                                ),
+                            },
+                        },
+                    ],
+                };
+            },
+        );
+
+        server.registerPrompt(
+            PATCHWALK_COMPOSE_ONBOARDING_PROMPT_NAME,
+            {
+                title: 'Compose Patchwalk Onboarding Walk',
+                description:
+                    'Draft a spoken Patchwalk walk that onboards a newcomer to a whole codebase (or an area) — architecture, entrypoints, core modules, data flow, and conventions — the WHAT and the WHY, written to be heard.',
+                argsSchema: patchwalkOnboardingPromptArgsSchema,
+            },
+            async (args) => {
+                return {
+                    messages: [
+                        {
+                            role: 'user' as const,
+                            content: {
+                                type: 'text' as const,
+                                text: createPatchwalkOnboardingPromptText(args, sessionStyle),
                             },
                         },
                     ],
@@ -1046,97 +844,105 @@ export class PatchwalkMcpServer {
         server.registerTool(
             PATCHWALK_PLAY_TOOL_NAME,
             {
-                title: 'Patchwalk Playback',
-                description:
-                    'Route a Patchwalk handoff to the best matching live editor window and play it there. Construct payloads as semantic patch explanations for engineers: explain behavior change, why it matters, risk signals, blast radius, before-vs-after behavior, tests, and architecture where relevant; filter out formatting and import-order noise.',
-                inputSchema: patchwalkPlayArgumentsSchema,
-                outputSchema: patchwalkPlayResultSchema,
+                title: 'Patchwalk Play Walk',
+                description: createPatchwalkPlayToolDescription(sessionStyle),
+                inputSchema: createPatchwalkPlayInputShape(sessionStyle),
+                outputSchema: patchwalkPlayResultShape,
                 annotations: {
                     openWorldHint: false,
                     readOnlyHint: false,
                 },
             },
             async (argumentsValue, extra) => {
-                // Normalize the payload once so routing, status, and playback all see the same basePath.
-                const payload = await this.normalizePayload(
-                    normalizePatchwalkPlayPayload(argumentsValue),
-                );
+                // Validate against the ACTIVE STYLE's walk schema so a malformed or over-long payload
+                // gets a clear, actionable message instead of a cryptic transport error.
+                const validation =
+                    createPatchwalkPlayPayloadSchema(sessionStyle).safeParse(argumentsValue);
+                if (!validation.success) {
+                    // Report EVERY problem at once. Surfacing them one at a time turns a strict
+                    // schema into a guessing game and makes the tool feel like a fight.
+                    const problems = formatPatchwalkValidationIssues(validation.error);
+                    const listed = problems.slice(0, 25);
+                    const remaining = problems.length - listed.length;
+                    return {
+                        isError: true,
+                        content: [
+                            {
+                                type: 'text' as const,
+                                text: [
+                                    `Patchwalk rejected this walk (${problems.length} problem${
+                                        problems.length === 1 ? '' : 's'
+                                    }). Fix ALL of them in one pass, then call ${PATCHWALK_PLAY_TOOL_NAME} again:`,
+                                    '',
+                                    ...listed.map((problem) => `- ${problem}`),
+                                    ...(remaining > 0 ? [`- ...and ${remaining} more.`] : []),
+                                    '',
+                                    'Length limits are a hard gate, not a suggestion: the walk is SPOKEN ALOUD to a human who cannot skim it. Cut to the signal — what changed, why, what it risks — and delete filler, hedging, and anything that restates the code.',
+                                    'See patchwalk://handoff/authoring-guide and patchwalk://handoff/example.',
+                                ].join('\n'),
+                            },
+                        ],
+                    };
+                }
+                const payload = await this.normalizePayload(validation.data);
                 const session = getSession();
 
-                // Logging messages give MCP-aware clients progress visibility during long playbacks.
-                logger.info('MCP tool call started playback routing.', {
+                logger.info('MCP tool call requested a walk launch.', {
                     handoffId: payload.handoffId,
                     basePath: payload.basePath,
                     sessionId: extra.sessionId ?? null,
                 });
-                await server.sendLoggingMessage(
-                    {
-                        level: 'info',
-                        data: `Starting Patchwalk routing for ${payload.handoffId}`,
-                    },
-                    extra.sessionId,
-                );
 
                 try {
-                    const dispatchResult = await this.dispatchPlayback(payload);
-
-                    logger.info('MCP tool call completed playback routing.', {
-                        handoffId: payload.handoffId,
-                        workerId: dispatchResult.workerId,
-                        matchedRoot: dispatchResult.matchedRoot,
-                        sessionId: extra.sessionId ?? null,
-                    });
+                    // Launch + ack (P2): resolve as soon as the window has STARTED the walk, never
+                    // when it finishes. The developer drives the running walk from the sidebar.
+                    const launch = await this.dispatchPlayback(payload);
                     await server.sendLoggingMessage(
                         {
                             level: 'info',
-                            data: `Completed Patchwalk playback for ${payload.handoffId} via worker ${dispatchResult.workerId}`,
+                            data: `Launched Patchwalk walk ${payload.handoffId} in worker ${launch.workerId}`,
                         },
                         extra.sessionId,
                     );
 
                     return {
                         structuredContent: {
+                            status: 'launched' as const,
+                            walkId: launch.walkId,
                             handoffId: payload.handoffId,
-                            status: 'completed' as const,
-                            stepsPlayed: dispatchResult.stepsPlayed,
-                            workerId: dispatchResult.workerId,
-                            matchedRoot: dispatchResult.matchedRoot,
+                            workerId: launch.workerId,
+                            matchedRoot: launch.matchedRoot,
+                            steps: launch.stepCount,
                         },
                         content: [
                             {
                                 type: 'text' as const,
-                                text: `Patchwalk playback completed for ${payload.handoffId}.`,
+                                text: `Patchwalk launched the walk for ${payload.handoffId} in window ${launch.workerId} (${launch.stepCount} segments). The developer drives it from the Patchwalk sidebar; call ${PATCHWALK_STATUS_TOOL_NAME} to check progress or ${PATCHWALK_STOP_TOOL_NAME} to end it.`,
                             },
-                            {
-                                type: 'text' as const,
-                                text: session
-                                    ? `Session ${session.id} handled ${session.requestCount} MCP request(s).`
-                                    : `Worker ${dispatchResult.workerId} handled the playback.`,
-                            },
+                            ...(session
+                                ? [
+                                      {
+                                          type: 'text' as const,
+                                          text: `MCP session ${session.id} · ${session.requestCount} request(s).`,
+                                      },
+                                  ]
+                                : []),
                         ],
                     };
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error);
-                    logger.error('MCP tool call failed during playback routing.', {
+                    logger.error('MCP tool call failed to launch a walk.', {
                         handoffId: payload.handoffId,
                         sessionId: extra.sessionId ?? null,
                         error: message,
                     });
-
-                    await server.sendLoggingMessage(
-                        {
-                            level: 'error',
-                            data: `Patchwalk playback failed for ${payload.handoffId}: ${message}`,
-                        },
-                        extra.sessionId,
-                    );
 
                     return {
                         isError: true,
                         content: [
                             {
                                 type: 'text' as const,
-                                text: `Patchwalk playback failed for ${payload.handoffId}: ${message}`,
+                                text: `Patchwalk could not launch the walk for ${payload.handoffId}: ${message}`,
                             },
                         ],
                     };
@@ -1144,24 +950,105 @@ export class PatchwalkMcpServer {
             },
         );
 
+        server.registerTool(
+            PATCHWALK_STOP_TOOL_NAME,
+            {
+                title: 'Stop Patchwalk Playback',
+                description:
+                    'Stop the single active Patchwalk narration running anywhere on the local machine.',
+                inputSchema: {},
+                outputSchema: patchwalkStopResultShape,
+                annotations: {
+                    openWorldHint: false,
+                    readOnlyHint: false,
+                },
+            },
+            async (_argumentsValue, extra) => {
+                try {
+                    const stopResult = await this.stopActivePlayback();
+                    return {
+                        structuredContent: patchwalkStopResultSchema.parse(stopResult),
+                        content: [
+                            {
+                                type: 'text' as const,
+                                text:
+                                    stopResult.status === 'idle'
+                                        ? 'Patchwalk was already idle.'
+                                        : `Stopped Patchwalk playback for ${stopResult.handoffId}.`,
+                            },
+                        ],
+                    };
+                } catch (error) {
+                    const message = error instanceof Error ? error.message : String(error);
+                    logger.error('MCP stop tool failed.', {
+                        sessionId: extra.sessionId ?? null,
+                        error: message,
+                    });
+                    return {
+                        isError: true,
+                        content: [
+                            {
+                                type: 'text' as const,
+                                text: `Patchwalk stop failed: ${message}`,
+                            },
+                        ],
+                    };
+                }
+            },
+        );
+
+        server.registerTool(
+            PATCHWALK_STATUS_TOOL_NAME,
+            {
+                title: 'Patchwalk Walk Status',
+                description:
+                    'Report the single active Patchwalk walk on this machine — window, step index/total, and state — or that nothing is playing.',
+                inputSchema: {},
+                outputSchema: patchwalkStatusResultShape,
+                annotations: {
+                    openWorldHint: false,
+                    readOnlyHint: true,
+                },
+            },
+            async () => {
+                const status = this.createStatusToolResult();
+                return {
+                    structuredContent: status,
+                    content: [
+                        {
+                            type: 'text' as const,
+                            text: status.active
+                                ? `Patchwalk is playing walk ${
+                                      status.handoffId ?? '(unknown)'
+                                  } in worker ${status.workerId ?? '(unknown)'} — segment ${
+                                      (status.stepIndex ?? 0) + 1
+                                  }/${status.stepCount ?? '?'} (${status.state ?? 'playing'}).`
+                                : 'No active Patchwalk walk.',
+                        },
+                    ],
+                };
+            },
+        );
+
         return server;
     }
 
     private createServerInstructions(): string {
-        // Keep server instructions short and action-oriented because MCP clients may surface them verbatim.
         return [
             'Patchwalk replays narrated code handoffs inside live editor windows.',
-            `Read ${PATCHWALK_STATUS_RESOURCE_URI} for daemon, worker, and dispatch status.`,
+            `Read ${PATCHWALK_STATUS_RESOURCE_URI} for daemon, worker, and active handoff status.`,
             `Read ${PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI} for a valid payload example.`,
             `Read ${PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI} before generating payloads for non-trivial changes.`,
-            `Use ${PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME} or ${PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME} to draft handoff content.`,
+            `Use ${PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME} or ${PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME} to draft a change walk, or ${PATCHWALK_COMPOSE_ONBOARDING_PROMPT_NAME} to draft a whole-codebase onboarding walk.`,
             `Call ${PATCHWALK_PLAY_TOOL_NAME} with a Patchwalk handoff payload that includes basePath and meaningful developer-facing narration.`,
+            `Call ${PATCHWALK_STOP_TOOL_NAME} to stop the one active Patchwalk narration.`,
+            `Call ${PATCHWALK_STATUS_TOOL_NAME} to check the active walk's window, progress, and state.`,
+            `${PATCHWALK_PLAY_TOOL_NAME} returns as soon as the walk is launched; it does not block until narration finishes.`,
         ].join(' ');
     }
 
     private createStatusResource(): PatchwalkStatusResource {
         const endpointUrl = this.endpointUrl ?? MCP_PATH;
-        // Status resources flatten internal maps into plain JSON so clients can render them directly.
         const workers: PatchwalkWorkerStatusResource[] = [...this.workers.values()].map(
             (worker) => ({
                 workerId: worker.workerId,
@@ -1170,18 +1057,24 @@ export class PatchwalkMcpServer {
                 workspaceRoots: worker.workspaceRoots,
                 registeredAt: worker.registeredAt,
                 lastSeenAt: worker.lastSeenAt,
+                connectionState: worker.connectionState,
+                playbackState: worker.playbackState,
+                activeHandoffId: worker.activeHandoffId,
             }),
         );
-        const activeDispatches: PatchwalkDispatchStatusResource[] = [
-            ...this.activeDispatches.values(),
-        ].map((dispatch) => ({
-            dispatchId: dispatch.dispatchId,
-            handoffId: dispatch.payload.handoffId,
-            basePath: dispatch.payload.basePath,
-            state: dispatch.state,
-            createdAt: dispatch.createdAt,
-            selectedWorkerId: dispatch.selectedWorkerId,
-        }));
+
+        const activeDispatches: PatchwalkDispatchStatusResource[] = this.activeDispatch
+            ? [
+                  {
+                      dispatchId: this.activeDispatch.dispatchId,
+                      handoffId: this.activeDispatch.payload.handoffId,
+                      basePath: this.activeDispatch.payload.basePath,
+                      state: this.activeDispatch.state,
+                      createdAt: this.activeDispatch.createdAt,
+                      selectedWorkerId: this.activeDispatch.selectedWorkerId,
+                  },
+              ]
+            : [];
 
         return {
             endpointUrl,
@@ -1194,9 +1087,11 @@ export class PatchwalkMcpServer {
             workers,
             activeDispatchCount: activeDispatches.length,
             activeDispatches,
+            activeHandoff: this.createActiveHandoffStatusResource(),
             prompts: [
                 PATCHWALK_COMPOSE_HANDOFF_PROMPT_NAME,
                 PATCHWALK_EXPAND_WALKTHROUGH_PROMPT_NAME,
+                PATCHWALK_COMPOSE_ONBOARDING_PROMPT_NAME,
             ],
             resources: [
                 PATCHWALK_STATUS_RESOURCE_URI,
@@ -1204,204 +1099,780 @@ export class PatchwalkMcpServer {
                 PATCHWALK_EXAMPLE_HANDOFF_RESOURCE_URI,
                 PATCHWALK_AUTHORING_GUIDE_RESOURCE_URI,
             ],
-            tools: [PATCHWALK_PLAY_TOOL_NAME],
+            tools: [PATCHWALK_PLAY_TOOL_NAME, PATCHWALK_STOP_TOOL_NAME, PATCHWALK_STATUS_TOOL_NAME],
         };
+    }
+
+    private createStatusToolResult(): PatchwalkStatusResult {
+        const active = this.createActiveHandoffStatusResource();
+        if (!active) {
+            return { active: false };
+        }
+        return {
+            active: true,
+            walkId: this.activeDispatch?.walkId,
+            handoffId: active.handoffId ?? undefined,
+            workerId: active.workerId ?? undefined,
+            state: active.state,
+            stepIndex: this.activeDispatch?.currentStepIndex,
+            stepCount: this.activeDispatch?.stepCount,
+        };
+    }
+
+    private createActiveHandoffStatusResource(): PatchwalkActiveHandoffStatusResource | null {
+        if (this.activeDispatch) {
+            return {
+                dispatchId: this.activeDispatch.dispatchId,
+                handoffId: this.activeDispatch.payload.handoffId,
+                basePath: this.activeDispatch.payload.basePath,
+                workerId: this.activeDispatch.selectedWorkerId ?? null,
+                state: this.activeDispatch.state,
+                source: 'daemon-dispatch',
+            };
+        }
+
+        const activeWorker = [...this.workers.values()].find(
+            (worker) => worker.playbackState !== 'idle',
+        );
+        if (!activeWorker) {
+            return null;
+        }
+
+        return {
+            dispatchId: null,
+            handoffId: activeWorker.activeHandoffId,
+            basePath: null,
+            workerId: activeWorker.workerId,
+            state: activeWorker.playbackState === 'playing' ? 'playing' : 'stopping',
+            source: 'worker-state',
+        };
+    }
+
+    private handleWorkerSocket(socket: WebSocket): void {
+        socket.on('message', (rawData: WebSocket.RawData) => {
+            this.handleWorkerMessage(socket, rawData).catch((error: unknown) => {
+                logger.error('Worker socket message handling failed.', error);
+                socket.close();
+            });
+        });
+
+        socket.on('close', () => {
+            this.handleWorkerDisconnect(socket);
+        });
+
+        socket.on('error', (error: Error) => {
+            logger.error('Worker WebSocket emitted an error.', error);
+        });
+    }
+
+    private async handleWorkerMessage(
+        socket: WebSocket,
+        rawData: WebSocket.RawData,
+    ): Promise<void> {
+        let parsedValue: unknown;
+        try {
+            parsedValue = JSON.parse(String(rawData));
+        } catch {
+            socket.close();
+            return;
+        }
+
+        const parsedMessage = patchwalkWorkerToDaemonMessageSchema.safeParse(parsedValue);
+        if (!parsedMessage.success) {
+            logger.warn('Worker message rejected because the payload was invalid.', {
+                reason: parsedMessage.error.issues[0]?.message ?? 'Invalid worker socket payload.',
+            });
+            socket.close();
+            return;
+        }
+
+        const message = parsedMessage.data;
+        switch (message.type) {
+            case 'worker.register':
+                await this.handleWorkerRegister(socket, message);
+                return;
+            case 'worker.update':
+                await this.handleWorkerUpdate(message);
+                return;
+            case 'worker.heartbeat':
+                this.handleWorkerHeartbeat(message);
+                return;
+            case 'playback.ready':
+                this.handlePlaybackReady(message);
+                return;
+            case 'playback.started':
+                this.handlePlaybackStarted(message);
+                return;
+            case 'playback.progress':
+                this.handlePlaybackProgress(message);
+                return;
+            case 'playback.completed':
+                this.handlePlaybackCompleted(message);
+                return;
+            case 'playback.failed':
+                this.handlePlaybackFailed(message);
+                return;
+            case 'playback.stopped':
+                this.handlePlaybackStopped(message);
+                return;
+            case 'playback.paused':
+            case 'playback.resumed':
+                // Pause/resume are reported to the daemon via playback.progress state; these
+                // explicit acks are reserved for future use and need no dispatch action today.
+                return;
+        }
+    }
+
+    private async handleWorkerRegister(
+        socket: WebSocket,
+        message: PatchwalkWorkerRegisterMessage,
+    ): Promise<void> {
+        const workspaceRoots = await normalizeWorkspaceRoots(message.workspaceRoots);
+        const existingWorker = this.workers.get(message.workerId);
+        this.applyNarrationStyle(message.narrationStyle);
+
+        if (existingWorker && existingWorker.socket !== socket) {
+            existingWorker.socket.close();
+        }
+
+        const registeredWorker: RegisteredWorker = existingWorker
+            ? {
+                  ...existingWorker,
+                  processId: message.processId,
+                  extensionVersion: message.extensionVersion,
+                  workspaceRoots,
+                  lastSeenAt: message.lastSeenAt,
+                  connectionState: 'connected',
+                  playbackState: message.playbackState,
+                  activeHandoffId: message.activeHandoffId ?? null,
+                  socket,
+              }
+            : {
+                  workerId: message.workerId,
+                  processId: message.processId,
+                  extensionVersion: message.extensionVersion,
+                  workspaceRoots,
+                  registeredAt: new Date().toISOString(),
+                  registeredSequence: ++this.workerSequence,
+                  lastSeenAt: message.lastSeenAt,
+                  connectionState: 'connected',
+                  playbackState: message.playbackState,
+                  activeHandoffId: message.activeHandoffId ?? null,
+                  socket,
+              };
+
+        this.workers.set(message.workerId, registeredWorker);
+        logger.info('Worker registration accepted.', {
+            workerId: registeredWorker.workerId,
+            processId: registeredWorker.processId,
+            workspaceRootCount: registeredWorker.workspaceRoots.length,
+            playbackState: registeredWorker.playbackState,
+        });
+
+        // A window that connects mid-walk still learns which window is currently playing.
+        this.trySendWorkerMessage(
+            registeredWorker.workerId,
+            this.buildWalkOwnerMessage(registeredWorker.workerId),
+        );
+    }
+
+    /**
+     * Adopt the machine-wide narration style reported by a window. Sessions opened AFTER this point
+     * get the new tool schema, description, guide and prompts; sessions already open keep the
+     * contract they were created with, so an agent never sees the rules change mid-connection.
+     */
+    private applyNarrationStyle(style: PatchwalkNarrationStyle | undefined): void {
+        if (!style || style === this.narrationStyle) {
+            return;
+        }
+        logger.info('Narration style changed.', { from: this.narrationStyle, to: style });
+        this.narrationStyle = style;
+    }
+
+    private async handleWorkerUpdate(message: PatchwalkWorkerUpdateMessage): Promise<void> {
+        const worker = this.workers.get(message.workerId);
+        this.applyNarrationStyle(message.narrationStyle);
+        if (!worker) {
+            return;
+        }
+
+        worker.workspaceRoots = await normalizeWorkspaceRoots(message.workspaceRoots);
+        worker.lastSeenAt = message.lastSeenAt;
+        worker.playbackState = message.playbackState;
+        worker.activeHandoffId = message.activeHandoffId ?? null;
+    }
+
+    private handleWorkerHeartbeat(message: PatchwalkWorkerHeartbeatMessage): void {
+        const worker = this.workers.get(message.workerId);
+        if (!worker) {
+            return;
+        }
+
+        worker.lastSeenAt = message.lastSeenAt;
+        worker.playbackState = message.playbackState;
+        worker.activeHandoffId = message.activeHandoffId ?? null;
+    }
+
+    private isForActiveDispatch(dispatchId: string, workerId: string): boolean {
+        return (
+            this.activeDispatch !== undefined &&
+            this.activeDispatch.dispatchId === dispatchId &&
+            this.activeDispatch.selectedWorkerId === workerId
+        );
+    }
+
+    private clearActiveDispatch(dispatchId: string): void {
+        if (this.activeDispatch?.dispatchId === dispatchId) {
+            this.activeDispatch = undefined;
+            // The machine-wide walk ended; tell every window to drop its "playing" signal.
+            this.broadcastWalkOwner();
+        }
+    }
+
+    private handlePlaybackReady(message: PatchwalkPlaybackReadyMessage): void {
+        if (this.isForActiveDispatch(message.dispatchId, message.workerId)) {
+            this.activeDispatch?.readyResolve?.();
+        }
+    }
+
+    private handlePlaybackStarted(message: PatchwalkPlaybackStartedMessage): void {
+        const worker = this.workers.get(message.workerId);
+        if (worker) {
+            worker.playbackState = 'playing';
+            worker.activeHandoffId = message.handoffId;
+        }
+
+        if (this.isForActiveDispatch(message.dispatchId, message.workerId) && this.activeDispatch) {
+            this.activeDispatch.state = 'playing';
+            this.activeDispatch.stepCount = message.stepCount;
+            this.activeDispatch.currentStepIndex = 0;
+            this.activeDispatch.startedResolve?.(message.stepCount);
+            // Tell every window which one is now playing (Problem 4: which-window signal).
+            this.broadcastWalkOwner();
+        }
+    }
+
+    private handlePlaybackProgress(message: PatchwalkPlaybackProgressMessage): void {
+        const worker = this.workers.get(message.workerId);
+        if (worker) {
+            worker.playbackState = message.playbackState;
+            worker.activeHandoffId = message.playbackState === 'idle' ? null : message.handoffId;
+        }
+
+        if (this.isForActiveDispatch(message.dispatchId, message.workerId) && this.activeDispatch) {
+            this.activeDispatch.currentStepIndex = message.stepIndex;
+            this.activeDispatch.stepCount = message.stepCount;
+        }
+    }
+
+    private handlePlaybackCompleted(message: {
+        dispatchId: string;
+        handoffId: string;
+        stepsPlayed: number;
+        workerId: string;
+    }): void {
+        const worker = this.workers.get(message.workerId);
+        if (worker) {
+            worker.playbackState = 'idle';
+            worker.activeHandoffId = null;
+        }
+
+        if (!this.isForActiveDispatch(message.dispatchId, message.workerId)) {
+            return;
+        }
+
+        logger.info('Worker reported completed walk.', {
+            workerId: message.workerId,
+            dispatchId: message.dispatchId,
+            handoffId: message.handoffId,
+            stepsPlayed: message.stepsPlayed,
+        });
+        this.clearActiveDispatch(message.dispatchId);
+    }
+
+    private handlePlaybackFailed(message: PatchwalkPlaybackFailedMessage): void {
+        const worker = this.workers.get(message.workerId);
+        if (worker && message.phase !== 'prepare') {
+            worker.playbackState = 'idle';
+            worker.activeHandoffId = null;
+        }
+
+        if (!this.isForActiveDispatch(message.dispatchId, message.workerId)) {
+            return;
+        }
+        const dispatch = this.activeDispatch;
+        if (!dispatch) {
+            return;
+        }
+
+        if (message.phase === 'prepare') {
+            // Negative prepare ack → the dispatch fails over to the next ranked window.
+            dispatch.readyReject?.(new Error(message.error));
+            return;
+        }
+
+        if (message.phase === 'stop') {
+            dispatch.stopAcknowledgeReject?.(new Error(message.error));
+            return;
+        }
+
+        // Execute-phase failure. If it happens before the launch ack, unblock the launch as a
+        // hard failure (we already committed this window, so we do NOT silently retry another).
+        if (dispatch.startedReject) {
+            dispatch.startedReject(new Error(message.error));
+        }
+        logger.error('Worker reported failed walk.', {
+            workerId: message.workerId,
+            dispatchId: message.dispatchId,
+            handoffId: message.handoffId,
+            error: message.error,
+        });
+        this.clearActiveDispatch(message.dispatchId);
+    }
+
+    private handlePlaybackStopped(message: {
+        dispatchId: string;
+        handoffId: string;
+        workerId: string;
+    }): void {
+        const worker = this.workers.get(message.workerId);
+        if (worker) {
+            worker.playbackState = 'idle';
+            worker.activeHandoffId = null;
+        }
+
+        if (!this.isForActiveDispatch(message.dispatchId, message.workerId)) {
+            return;
+        }
+
+        this.activeDispatch?.stopAcknowledgeResolve?.();
+        this.clearActiveDispatch(message.dispatchId);
+    }
+
+    private handleWorkerDisconnect(socket: WebSocket): void {
+        const worker = [...this.workers.values()].find((candidate) => candidate.socket === socket);
+        if (!worker) {
+            return;
+        }
+
+        this.workers.delete(worker.workerId);
+        logger.info('Worker removed from daemon registry.', {
+            workerId: worker.workerId,
+            remainingWorkerCount: this.workers.size,
+        });
+
+        this.teardownDispatchForLostWorker(worker.workerId);
+    }
+
+    /**
+     * Release the active dispatch (and any pending handshake) when the window it was dispatched to
+     * is gone. Shared by the socket-close path and the stale-worker prune so a window that vanishes
+     * WITHOUT a clean close event (hang / half-open socket / sleep-wake) can never wedge the
+     * machine-wide walk lock or leave every other window's "playing elsewhere" badge stuck.
+     */
+    private teardownDispatchForLostWorker(workerId: string): void {
+        const dispatch = this.activeDispatch;
+        if (!dispatch || dispatch.selectedWorkerId !== workerId) {
+            return;
+        }
+
+        if (dispatch.state === 'preparing') {
+            // Failover to the next candidate: the prepare handshake never completed.
+            dispatch.readyReject?.(
+                new Error(`Worker ${workerId} disconnected before it became ready.`),
+            );
+            return;
+        }
+
+        if (dispatch.state === 'executing') {
+            dispatch.startedReject?.(
+                new Error(`Worker ${workerId} disconnected before starting the walk.`),
+            );
+            this.clearActiveDispatch(dispatch.dispatchId);
+            return;
+        }
+
+        if (dispatch.state === 'stopping') {
+            dispatch.stopAcknowledgeResolve?.();
+            this.clearActiveDispatch(dispatch.dispatchId);
+            return;
+        }
+
+        // 'playing': the walk was lost with its window; release the machine-wide lock + badges.
+        this.clearActiveDispatch(dispatch.dispatchId);
     }
 
     private async dispatchPlayback(
         payload: PatchwalkHandoffPayload,
-    ): Promise<DispatchExecutionResult> {
-        // Prune before dispatch so a dead window cannot win an otherwise valid route.
+    ): Promise<DispatchLaunchResult> {
         this.pruneStaleWorkers();
 
-        if (this.workers.size === 0) {
-            throw new Error('No live Patchwalk editor windows are registered.');
+        if (this.hasAnyActiveHandoff()) {
+            throw new Error(
+                'Patchwalk already has an active handoff on this machine. Stop it before starting another one.',
+            );
         }
 
-        // Promise plumbing lives on the dispatch so worker results can resolve it from a different route.
-        const resultState = {} as {
-            resolve?: (value: DispatchExecutionResult) => void;
-            reject?: (error: Error) => void;
-        };
-        const resultPromise = new Promise<DispatchExecutionResult>((resolve, reject) => {
-            resultState.resolve = resolve;
-            resultState.reject = reject;
-        });
+        const rankedCandidates = this.rankWorkersForBasePath(payload.basePath);
+        if (rankedCandidates.length === 0) {
+            throw new Error(
+                `No live Patchwalk window matched the requested basePath: ${payload.basePath}`,
+            );
+        }
 
         const dispatch: ActiveDispatch = {
             dispatchId: randomUUID(),
+            walkId: randomUUID(),
             payload,
             createdAt: new Date().toISOString(),
-            state: 'claiming',
-            claims: [],
-            resultPromise,
-            resolveResult: resultState.resolve!,
-            rejectResult: resultState.reject!,
+            state: 'preparing',
         };
-        this.activeDispatches.set(dispatch.dispatchId, dispatch);
-        logger.info('Dispatch created for playback request.', {
+        this.activeDispatch = dispatch;
+        logger.info('Dispatch created for walk launch.', {
             dispatchId: dispatch.dispatchId,
+            walkId: dispatch.walkId,
             handoffId: payload.handoffId,
             basePath: payload.basePath,
             registeredWorkerCount: this.workers.size,
         });
 
         try {
-            // Broadcast only the minimal claim payload first; the full handoff waits for the winner.
-            const claimEvent: PatchwalkWorkerEvent = {
-                type: 'playback.claim',
-                eventId: randomUUID(),
-                dispatchId: dispatch.dispatchId,
-                handoffId: payload.handoffId,
-                basePath: payload.basePath,
-            };
-            for (const worker of this.workers.values()) {
-                // Broadcast one lightweight claim request to every live worker.
-                this.enqueueWorkerEvent(worker.workerId, claimEvent);
-            }
+            // Resolves once a window has STARTED the walk. The dispatch intentionally stays active
+            // afterwards so later completed/stopped messages release the machine-wide lock; we only
+            // clear it here when the launch itself fails (no window could start the walk).
+            return await this.tryDispatchCandidate(dispatch, rankedCandidates, 0);
+        } catch (error) {
+            this.clearActiveDispatch(dispatch.dispatchId);
+            throw error;
+        }
+    }
 
-            await createDelay(CLAIM_WINDOW_MS);
-
-            // Winner selection is deterministic and centralized in the daemon.
-            const selectedClaim = [...dispatch.claims].sort(compareWorkerClaims)[0];
-            if (!selectedClaim) {
-                logger.warn('Dispatch failed because no worker claimed the requested base path.', {
-                    dispatchId: dispatch.dispatchId,
-                    handoffId: payload.handoffId,
-                    basePath: payload.basePath,
-                });
-                throw new Error(
-                    `No live Patchwalk window matched the requested basePath: ${payload.basePath}`,
-                );
-            }
-
-            dispatch.state = 'executing';
-            dispatch.selectedWorkerId = selectedClaim.workerId;
-            dispatch.selectedMatchedRoot = selectedClaim.matchedRoot;
-            logger.info('Dispatch selected worker claim.', {
-                dispatchId: dispatch.dispatchId,
-                workerId: selectedClaim.workerId,
-                matchedRoot: selectedClaim.matchedRoot,
-                matchKind: selectedClaim.matchKind,
-            });
-
-            // Let losing workers clear any pending local state for this dispatch.
-            for (const claim of dispatch.claims) {
-                if (claim.workerId === selectedClaim.workerId) {
-                    continue;
-                }
-
-                this.enqueueWorkerEvent(claim.workerId, {
-                    type: 'playback.cancel',
-                    eventId: randomUUID(),
-                    dispatchId: dispatch.dispatchId,
-                    reason: `Worker ${selectedClaim.workerId} won the routing decision.`,
-                });
-            }
-
-            // Only the winner receives the full payload and performs editor-side work.
-            this.enqueueWorkerEvent(selectedClaim.workerId, {
-                type: 'playback.execute',
-                eventId: randomUUID(),
-                dispatchId: dispatch.dispatchId,
-                payload,
-            });
-
-            return await withTimeout(
-                dispatch.resultPromise,
-                EXECUTION_TIMEOUT_MS,
-                `Worker ${selectedClaim.workerId} did not complete playback in time.`,
+    private async tryDispatchCandidate(
+        dispatch: ActiveDispatch,
+        rankedCandidates: PatchwalkWorkerRoutingCandidate[],
+        index: number,
+    ): Promise<DispatchLaunchResult> {
+        const candidate = rankedCandidates[index];
+        if (!candidate) {
+            throw new Error(
+                `No live Patchwalk window matched the requested basePath: ${dispatch.payload.basePath}`,
             );
-        } finally {
-            // Dispatches are purely in-memory and disappear once the tool call resolves.
-            this.activeDispatches.delete(dispatch.dispatchId);
-            logger.info('Dispatch removed from active registry.', {
+        }
+
+        const selectedWorker = this.workers.get(candidate.workerId);
+        if (!selectedWorker || selectedWorker.socket.readyState !== WebSocket.OPEN) {
+            return this.tryDispatchCandidate(dispatch, rankedCandidates, index + 1);
+        }
+
+        dispatch.selectedWorkerId = candidate.workerId;
+        dispatch.selectedMatchedRoot = candidate.matchedRoot;
+        dispatch.state = 'preparing';
+
+        this.sendWorkerMessage(candidate.workerId, {
+            type: 'playback.prepare',
+            messageId: randomUUID(),
+            workerId: candidate.workerId,
+            sentAt: new Date().toISOString(),
+            dispatchId: dispatch.dispatchId,
+            handoffId: dispatch.payload.handoffId,
+            basePath: dispatch.payload.basePath,
+        });
+
+        try {
+            // P3: proceed only on a POSITIVE ready ack. A window that is wedged, busy, or gone
+            // cannot silently swallow the walk — the timeout/failure fails over to the next one.
+            await this.waitForReady(dispatch, candidate.workerId);
+        } catch (error) {
+            logger.warn('Worker was not ready; failing over to the next candidate.', {
+                workerId: candidate.workerId,
                 dispatchId: dispatch.dispatchId,
-                remainingActiveDispatches: this.activeDispatches.size,
+                error: error instanceof Error ? error.message : String(error),
             });
+            return this.tryDispatchCandidate(dispatch, rankedCandidates, index + 1);
         }
+
+        dispatch.state = 'executing';
+        this.sendWorkerMessage(candidate.workerId, {
+            type: 'playback.execute',
+            messageId: randomUUID(),
+            workerId: candidate.workerId,
+            sentAt: new Date().toISOString(),
+            dispatchId: dispatch.dispatchId,
+            payload: dispatch.payload,
+        });
+
+        // Once execute is sent we are committed to this window: a missing start ack is a hard
+        // failure, not a failover (failing over could make two windows play the same walk).
+        const stepCount = await this.waitForStarted(dispatch, candidate.workerId);
+
+        dispatch.state = 'playing';
+        return {
+            workerId: candidate.workerId,
+            matchedRoot: candidate.matchedRoot,
+            walkId: dispatch.walkId,
+            stepCount,
+        };
     }
 
-    private enqueueWorkerEvent(workerId: string, event: PatchwalkWorkerEvent): void {
-        const worker = this.workers.get(workerId);
+    private async stopActivePlayback(): Promise<PatchwalkStopResult> {
+        const dispatch = this.activeDispatch;
+        if (!dispatch) {
+            // No dispatch, but a window may still be PLAYING (e.g. its socket blipped and the
+            // dispatch was released while local playback continued). Stop it by worker state so the
+            // stop tool never falsely reports idle while a walk is audibly running.
+            return this.stopPlayingWorkerWithoutDispatch();
+        }
+
+        if (!dispatch.selectedWorkerId) {
+            this.clearActiveDispatch(dispatch.dispatchId);
+            return { status: 'stopped', handoffId: dispatch.payload.handoffId };
+        }
+
+        const worker = this.workers.get(dispatch.selectedWorkerId);
         if (!worker) {
-            return;
+            this.clearActiveDispatch(dispatch.dispatchId);
+            return {
+                status: 'stopped',
+                handoffId: dispatch.payload.handoffId,
+                workerId: dispatch.selectedWorkerId,
+            };
         }
 
-        // Events queue in memory until the worker's next long-poll returns.
-        worker.pendingEvents.push(event);
-        if (!worker.pendingPoll) {
-            return;
-        }
+        dispatch.state = 'stopping';
+        const stopAcknowledged = new Promise<void>((resolve, reject) => {
+            dispatch.stopAcknowledgeResolve = resolve;
+            dispatch.stopAcknowledgeReject = reject;
+        });
 
-        const pendingPoll = worker.pendingPoll;
-        worker.pendingPoll = undefined;
-        clearTimeout(pendingPoll.timeout);
-        // Flush immediately if the worker is already waiting on a long-poll response.
-        const events = worker.pendingEvents.splice(0, worker.pendingEvents.length);
-        pendingPoll.resolve(events);
+        this.sendWorkerMessage(worker.workerId, {
+            type: 'playback.stop',
+            messageId: randomUUID(),
+            workerId: worker.workerId,
+            sentAt: new Date().toISOString(),
+            dispatchId: dispatch.dispatchId,
+            handoffId: dispatch.payload.handoffId,
+            reason: 'Patchwalk stop tool requested cancellation.',
+        });
+
+        await withTimeout(
+            stopAcknowledged,
+            PATCHWALK_DEFAULT_STOP_TIMEOUT_MS,
+            `Worker ${worker.workerId} did not acknowledge stop in time.`,
+        );
+
+        this.clearActiveDispatch(dispatch.dispatchId);
+        return {
+            status: 'stopped',
+            handoffId: dispatch.payload.handoffId,
+            workerId: worker.workerId,
+        };
     }
 
-    private async waitForWorkerEvents(
-        worker: RegisteredWorker,
-        timeoutMs: number,
-    ): Promise<PatchwalkWorkerEvent[]> {
-        if (worker.pendingEvents.length > 0) {
-            // Flush immediately if work is already queued instead of waiting for the timeout.
-            return worker.pendingEvents.splice(0, worker.pendingEvents.length);
+    /**
+     * Last-resort stop when the daemon has no tracked dispatch but a window still reports playing
+     * (e.g. its socket blipped mid-walk and the dispatch was released while local playback
+     * continued). Sends the stop directly to that window's runner so the stop tool is never a
+     * silent no-op.
+     */
+    private stopPlayingWorkerWithoutDispatch(): PatchwalkStopResult {
+        const playingWorker = [...this.workers.values()].find(
+            (worker) => worker.playbackState !== 'idle',
+        );
+        if (!playingWorker) {
+            return { status: 'idle' };
         }
 
-        if (worker.pendingPoll) {
-            // A second poll means the worker likely restarted its event loop; force reconciliation.
-            clearTimeout(worker.pendingPoll.timeout);
-            worker.pendingPoll.resolve([
-                {
-                    type: 'worker.reconcile',
-                    eventId: randomUUID(),
-                },
-            ]);
-            worker.pendingPoll = undefined;
+        const handoffId = playingWorker.activeHandoffId ?? undefined;
+        try {
+            this.sendWorkerMessage(playingWorker.workerId, {
+                type: 'playback.stop',
+                messageId: randomUUID(),
+                workerId: playingWorker.workerId,
+                sentAt: new Date().toISOString(),
+                dispatchId: randomUUID(),
+                handoffId: handoffId ?? 'unknown-handoff',
+                reason: 'Patchwalk stop tool requested cancellation (no active dispatch).',
+            });
+        } catch {
+            // The socket is already gone, so the walk is unreachable; report it stopped anyway.
         }
+        playingWorker.playbackState = 'idle';
+        playingWorker.activeHandoffId = null;
+        this.broadcastWalkOwner();
+        return {
+            status: 'stopped',
+            workerId: playingWorker.workerId,
+            ...(handoffId ? { handoffId } : {}),
+        };
+    }
 
-        return new Promise((resolve) => {
-            const timeout = setTimeout(() => {
-                if (worker.pendingPoll?.resolve === resolve) {
-                    worker.pendingPoll = undefined;
+    private rankWorkersForBasePath(basePath: string): PatchwalkWorkerRoutingCandidate[] {
+        return [...this.workers.values()]
+            .filter((worker) => worker.connectionState === 'connected')
+            .map((worker) => {
+                const match = matchBasePathToWorkspaceRoots(basePath, worker.workspaceRoots);
+                if (!match) {
+                    return null;
                 }
 
-                // Empty event batches are normal and tell the worker to long-poll again.
-                resolve([]);
-            }, timeoutMs);
+                return {
+                    workerId: worker.workerId,
+                    matchedRoot: match.matchedRoot,
+                    matchKind: match.matchKind,
+                    registeredSequence: worker.registeredSequence,
+                } satisfies PatchwalkWorkerRoutingCandidate;
+            })
+            .filter((candidate): candidate is PatchwalkWorkerRoutingCandidate => candidate !== null)
+            .sort(compareWorkerRoutingCandidates);
+    }
 
-            worker.pendingPoll = {
-                resolve,
-                timeout,
+    private sendWorkerMessage(workerId: string, message: PatchwalkDaemonToWorkerMessage): void {
+        const worker = this.workers.get(workerId);
+        if (!worker || worker.socket.readyState !== WebSocket.OPEN) {
+            throw new Error(`Worker ${workerId} is not connected.`);
+        }
+
+        worker.socket.send(JSON.stringify(message));
+    }
+
+    /** Best-effort send that silently skips a closed socket (used for owner broadcasts). */
+    private trySendWorkerMessage(workerId: string, message: PatchwalkDaemonToWorkerMessage): void {
+        const worker = this.workers.get(workerId);
+        if (!worker || worker.socket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        worker.socket.send(JSON.stringify(message));
+    }
+
+    private buildWalkOwnerMessage(workerId: string): PatchwalkWalkOwnerMessage {
+        const dispatch = this.activeDispatch;
+        // A walk "owns" a window only once it is actually PLAYING. Broadcasts fire on the started
+        // transition, so gating on 'playing' keeps a mid-prepare register message consistent with
+        // what already-connected windows were told (they get nothing until 'started').
+        const active = Boolean(
+            dispatch && dispatch.state === 'playing' && dispatch.selectedWorkerId,
+        );
+        return {
+            type: 'walk.owner',
+            messageId: randomUUID(),
+            workerId,
+            sentAt: new Date().toISOString(),
+            active,
+            ...(active && dispatch
+                ? {
+                      ownerWorkerId: dispatch.selectedWorkerId,
+                      handoffId: dispatch.payload.handoffId,
+                      revealPath: dispatch.selectedMatchedRoot ?? dispatch.payload.basePath,
+                  }
+                : {}),
+        };
+    }
+
+    /** Tell every connected window which window currently owns the active walk (or that none does). */
+    private broadcastWalkOwner(): void {
+        for (const workerId of this.workers.keys()) {
+            this.trySendWorkerMessage(workerId, this.buildWalkOwnerMessage(workerId));
+        }
+    }
+
+    private waitForReady(dispatch: ActiveDispatch, workerId: string): Promise<void> {
+        return new Promise<void>((resolve, reject) => {
+            // cleanup() has to clear a timer that does not exist yet, so the handle lives in a box.
+            const timeout: { handle?: NodeJS.Timeout } = {};
+            const cleanup = (): void => {
+                clearTimeout(timeout.handle);
+                dispatch.readyResolve = undefined;
+                dispatch.readyReject = undefined;
+            };
+            timeout.handle = setTimeout(() => {
+                cleanup();
+                reject(createTimeoutError(`Worker ${workerId} did not become ready in time.`));
+            }, PATCHWALK_DEFAULT_READY_TIMEOUT_MS);
+            dispatch.readyResolve = () => {
+                cleanup();
+                resolve();
+            };
+            dispatch.readyReject = (error: Error) => {
+                cleanup();
+                reject(error);
             };
         });
     }
 
-    private disposeWorker(workerId: string): void {
-        const worker = this.workers.get(workerId);
-        if (!worker) {
-            return;
-        }
-
-        if (worker.pendingPoll) {
-            clearTimeout(worker.pendingPoll.timeout);
-            // Resolve the hanging poll so worker shutdown does not leak promises.
-            worker.pendingPoll.resolve([]);
-            worker.pendingPoll = undefined;
-        }
-
-        this.workers.delete(workerId);
-        logger.info('Worker removed from daemon registry.', {
-            workerId,
-            remainingWorkerCount: this.workers.size,
+    private waitForStarted(dispatch: ActiveDispatch, workerId: string): Promise<number> {
+        return new Promise<number>((resolve, reject) => {
+            // cleanup() has to clear a timer that does not exist yet, so the handle lives in a box.
+            const timeout: { handle?: NodeJS.Timeout } = {};
+            const cleanup = (): void => {
+                clearTimeout(timeout.handle);
+                dispatch.startedResolve = undefined;
+                dispatch.startedReject = undefined;
+            };
+            timeout.handle = setTimeout(() => {
+                cleanup();
+                reject(
+                    createTimeoutError(`Worker ${workerId} accepted but never started the walk.`),
+                );
+            }, PATCHWALK_DEFAULT_READY_TIMEOUT_MS);
+            dispatch.startedResolve = (stepCount: number) => {
+                cleanup();
+                resolve(stepCount);
+            };
+            dispatch.startedReject = (error: Error) => {
+                cleanup();
+                reject(error);
+            };
         });
+    }
+
+    private hasAnyActiveHandoff(): boolean {
+        if (this.activeDispatch) {
+            return true;
+        }
+
+        return [...this.workers.values()].some((worker) => worker.playbackState !== 'idle');
+    }
+
+    /**
+     * Exit once no editor window has been attached for a while. `unref()` so this timer alone can
+     * never keep the process alive.
+     */
+    private startIdleWatchdog(): void {
+        const idleShutdownMs = this.options.idleShutdownMs ?? IDLE_SHUTDOWN_MS;
+        this.idleTimer = setInterval(() => {
+            this.pruneStaleWorkers();
+
+            const busy = this.workers.size > 0 || this.activeDispatch !== undefined;
+            if (busy) {
+                this.idleSince = null;
+                return;
+            }
+
+            if (this.idleSince === null) {
+                this.idleSince = Date.now();
+                return;
+            }
+
+            if (Date.now() - this.idleSince < idleShutdownMs) {
+                return;
+            }
+
+            logger.info('Patchwalk daemon is idle with no editor windows; shutting down.', {
+                idleMs: Date.now() - this.idleSince,
+            });
+            this.idleSince = null;
+            void this.stop()
+                .catch((error: unknown) => {
+                    logger.error('Patchwalk daemon failed to stop when idle.', error);
+                })
+                .finally(() => {
+                    this.options.onIdleShutdown?.();
+                });
+        }, this.options.idleCheckIntervalMs ?? IDLE_CHECK_INTERVAL_MS);
+        this.idleTimer.unref?.();
     }
 
     private pruneStaleWorkers(): void {
-        // Liveness is heartbeat-based; stale workers are treated as gone without any graceful handshake.
         const now = Date.now();
         for (const worker of this.workers.values()) {
             const ageMs = now - new Date(worker.lastSeenAt).getTime();
@@ -1410,62 +1881,14 @@ export class PatchwalkMcpServer {
                     workerId: worker.workerId,
                     ageMs,
                 });
-                this.disposeWorker(worker.workerId);
+                worker.socket.close();
+                this.workers.delete(worker.workerId);
+                // The socket 'close' event fires asynchronously (after this delete), so
+                // handleWorkerDisconnect would no longer find the worker. Tear down the dispatch
+                // here so a hung/half-open playing window cannot wedge the walk lock (P: prune-wedge).
+                this.teardownDispatchForLostWorker(worker.workerId);
             }
         }
-    }
-
-    private upsertWorker(registration: PatchwalkWorkerRegistration): RegisteredWorker {
-        const existingWorker = this.workers.get(registration.workerId);
-        if (existingWorker) {
-            // Re-registration is normal after a daemon restart or workspace-folder change.
-            existingWorker.processId = registration.processId;
-            existingWorker.extensionVersion = registration.extensionVersion;
-            existingWorker.workspaceRoots = registration.workspaceRoots;
-            existingWorker.lastSeenAt = registration.lastSeenAt;
-            logger.info('Worker registration refreshed existing worker record.', {
-                workerId: existingWorker.workerId,
-                workspaceRootCount: existingWorker.workspaceRoots.length,
-            });
-            return existingWorker;
-        }
-
-        const registeredWorker: RegisteredWorker = {
-            workerId: registration.workerId,
-            processId: registration.processId,
-            extensionVersion: registration.extensionVersion,
-            workspaceRoots: registration.workspaceRoots,
-            registeredAt: new Date().toISOString(),
-            registeredSequence: ++this.workerSequence,
-            lastSeenAt: registration.lastSeenAt,
-            pendingEvents: [],
-        };
-        // Registration sequence becomes the final deterministic tie-break when paths are otherwise equal.
-        this.workers.set(registeredWorker.workerId, registeredWorker);
-        logger.info('Worker registration created new worker record.', {
-            workerId: registeredWorker.workerId,
-            processId: registeredWorker.processId,
-            registrationSequence: registeredWorker.registeredSequence,
-        });
-        return registeredWorker;
-    }
-
-    private async normalizeWorkerRegistration(
-        registration: PatchwalkWorkerRegistration,
-    ): Promise<PatchwalkWorkerRegistration> {
-        return {
-            ...registration,
-            workspaceRoots: await normalizeWorkspaceRoots(registration.workspaceRoots),
-        };
-    }
-
-    private async normalizeWorkerHeartbeat(
-        heartbeat: PatchwalkWorkerHeartbeat,
-    ): Promise<PatchwalkWorkerHeartbeat> {
-        return {
-            ...heartbeat,
-            workspaceRoots: await normalizeWorkspaceRoots(heartbeat.workspaceRoots),
-        };
     }
 
     private async normalizePayload(
@@ -1473,7 +1896,6 @@ export class PatchwalkMcpServer {
     ): Promise<PatchwalkHandoffPayload> {
         return {
             ...payload,
-            // Normalize once here so routing and status never disagree about path identity.
             basePath: await normalizeAbsolutePath(payload.basePath),
         };
     }
@@ -1484,64 +1906,60 @@ export class PatchwalkMcpServer {
             return;
         }
 
-        await this.closeSession(session);
-    }
-
-    private async disposeOrphanedSession(session: PatchwalkMcpSession): Promise<void> {
-        if (session.disposed || session.id) {
-            return;
-        }
-
-        await this.closeSession(session);
-    }
-
-    private async closeSession(session: PatchwalkMcpSession): Promise<void> {
-        if (session.disposed) {
-            return;
-        }
-
-        // Mark disposed first so repeated close paths cannot double-close the same transport.
         session.disposed = true;
-        if (session.id) {
-            this.sessions.delete(session.id);
-        }
-
-        await Promise.allSettled([session.transport.close(), session.server.close()]);
+        this.sessions.delete(sessionId);
+        await Promise.allSettled([session.server.close(), session.transport.close()]);
         logger.info('MCP session resources disposed.', {
-            sessionId: session.id || null,
+            sessionId,
             activeSessionCount: this.sessions.size,
         });
     }
 
-    private async readJsonBody(request: IncomingMessage): Promise<unknown> {
-        const bodyChunks: Uint8Array[] = [];
-        let totalSize = 0;
-
-        for await (const chunk of request) {
-            // Convert every chunk to Uint8Array so Node's current Buffer.concat typing stays satisfied.
-            const chunkBuffer =
-                typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
-            totalSize += chunkBuffer.byteLength;
-
-            if (totalSize > MAX_REQUEST_BODY_BYTES) {
-                throw new Error('Request body is too large.');
-            }
-
-            bodyChunks.push(chunkBuffer);
+    private async disposeOrphanedSession(session: PatchwalkMcpSession): Promise<void> {
+        if (session.disposed) {
+            return;
         }
 
-        // Read the whole body before parsing so every route gets the same size and emptiness checks.
-        const rawBody = Buffer.concat(bodyChunks).toString('utf8');
-        if (!rawBody.trim()) {
-            throw new Error('Request body is empty.');
-        }
-
-        return JSON.parse(rawBody);
+        session.disposed = true;
+        await Promise.allSettled([session.server.close(), session.transport.close()]);
+        logger.warn('Disposed orphaned MCP session before session id assignment.');
     }
 
-    private writeJsonResponse(response: ServerResponse, statusCode: number, body: unknown): void {
-        // Every non-streaming daemon route returns plain JSON for easy local debugging.
-        response.writeHead(statusCode, { 'content-type': 'application/json' });
-        response.end(JSON.stringify(body));
+    private async readJsonBody(request: IncomingMessage): Promise<unknown> {
+        const bodyChunks: Uint8Array[] = [];
+        let bodyLength = 0;
+
+        for await (const chunk of request) {
+            const chunkBytes =
+                typeof chunk === 'string' ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
+            bodyLength += chunkBytes.byteLength;
+
+            if (bodyLength > MAX_REQUEST_BODY_BYTES) {
+                throw new Error('Request body exceeded the maximum supported size.');
+            }
+
+            bodyChunks.push(chunkBytes);
+        }
+
+        if (bodyChunks.length === 0) {
+            return {};
+        }
+
+        const bodyText = Buffer.concat(bodyChunks).toString('utf8').trim();
+        if (!bodyText) {
+            return {};
+        }
+
+        return JSON.parse(bodyText) as unknown;
+    }
+
+    private writeJsonResponse(
+        response: ServerResponse,
+        statusCode: number,
+        payload: unknown,
+    ): void {
+        response.statusCode = statusCode;
+        response.setHeader('content-type', 'application/json; charset=utf-8');
+        response.end(JSON.stringify(payload));
     }
 }

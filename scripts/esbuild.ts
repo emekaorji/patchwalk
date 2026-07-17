@@ -22,6 +22,8 @@ const options: BuildOptions = {
     external: [
         'vscode',
         'typescript', // vue-component-meta
+        // Optional native TTS addon: loaded lazily at runtime when installed; never bundled.
+        'sherpa-onnx-node',
     ],
     format: 'cjs',
     platform: 'node',

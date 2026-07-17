@@ -16,6 +16,11 @@ export interface PatchwalkWorkerClaimSummary extends PatchwalkWorkerMatch {
     registeredSequence: number;
 }
 
+export interface PatchwalkWorkerRoutingCandidate extends PatchwalkWorkerMatch {
+    workerId: string;
+    registeredSequence: number;
+}
+
 export const matchBasePathToWorkspaceRoots = (
     basePath: string,
     workspaceRoots: string[],
@@ -69,4 +74,11 @@ export const compareWorkerClaims = (
     }
 
     return leftClaim.registeredSequence - rightClaim.registeredSequence;
+};
+
+export const compareWorkerRoutingCandidates = (
+    leftCandidate: PatchwalkWorkerRoutingCandidate,
+    rightCandidate: PatchwalkWorkerRoutingCandidate,
+): number => {
+    return compareWorkerClaims(leftCandidate, rightCandidate);
 };
