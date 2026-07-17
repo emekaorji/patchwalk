@@ -3,6 +3,7 @@ import path from 'node:path';
 import * as vscode from 'vscode';
 
 import { validatePatchwalkPayload } from '../lib/schema';
+import { PatchwalkAgentConnector } from './mcpInject/agentConnector';
 import { PatchwalkOverviewController } from './overview/overviewPanel';
 import { PatchwalkPlaybackRunner } from './playback';
 import { PatchwalkWalkMonitorProvider } from './sidebar/walkMonitorView';
@@ -191,6 +192,12 @@ export function activate(context: vscode.ExtensionContext) {
         },
     );
 
+    // Auto-inject the Patchwalk MCP server into installed agents so the user only has to restart them.
+    const agentConnector = new PatchwalkAgentConnector(context, outputChannel, readDaemonPort);
+    const connectAgentsCommand = vscode.commands.registerCommand('patchwalk.connectAgents', () =>
+        agentConnector.connect(),
+    );
+
     const playFromClipboardCommand = vscode.commands.registerCommand(
         'patchwalk.playFromClipboard',
         async () => {
@@ -238,28 +245,35 @@ export function activate(context: vscode.ExtensionContext) {
         showDaemonStatusCommand,
         stopDaemonCommand,
         copyMcpEndpointCommand,
+        connectAgentsCommand,
         playFromClipboardCommand,
     );
 
-    // Tell a brand-new user the ONE thing they must do — exactly once, ever.
-    const WELCOME_SHOWN_KEY = 'patchwalk.welcomeShown';
-    if (!context.globalState.get<boolean>(WELCOME_SHOWN_KEY)) {
-        void context.globalState.update(WELCOME_SHOWN_KEY, true);
-        void vscode.window
-            .showInformationMessage(
+    // First activation, exactly once: auto-connect the MCP server into installed agents so the user
+    // just restarts them. Only fall back to the manual "copy endpoint" nudge if nothing was detected.
+    const ONBOARDED_KEY = 'patchwalk.onboarded.v1';
+    if (!context.globalState.get<boolean>(ONBOARDED_KEY)) {
+        void context.globalState.update(ONBOARDED_KEY, true);
+        const onboard = async (): Promise<void> => {
+            const summary = await agentConnector.connect({ firstRun: true });
+            if (summary.connected > 0 || summary.failed > 0 || summary.already > 0) {
+                return; // the connector already told the user what happened
+            }
+            // No supported agent found — tell the newcomer the one thing they must do.
+            const choice = await vscode.window.showInformationMessage(
                 'Patchwalk is running. Point your AI agent at its MCP endpoint and it will explain code changes out loud, right here in your editor.',
                 'Copy MCP endpoint',
                 'Read setup guide',
-            )
-            .then((choice) => {
-                if (choice === 'Copy MCP endpoint') {
-                    void vscode.commands.executeCommand('patchwalk.copyMcpEndpoint');
-                } else if (choice === 'Read setup guide') {
-                    void vscode.env.openExternal(
-                        vscode.Uri.parse('https://github.com/emekaorji/patchwalk#readme'),
-                    );
-                }
-            });
+            );
+            if (choice === 'Copy MCP endpoint') {
+                await vscode.commands.executeCommand('patchwalk.copyMcpEndpoint');
+            } else if (choice === 'Read setup guide') {
+                await vscode.env.openExternal(
+                    vscode.Uri.parse('https://github.com/emekaorji/patchwalk#readme'),
+                );
+            }
+        };
+        runInBackground(onboard(), 'Patchwalk agent onboarding failed');
     }
 
     runInBackground(workerController.start(), 'Failed to start Patchwalk worker');
