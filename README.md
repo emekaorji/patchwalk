@@ -16,7 +16,7 @@ three jobs:
 2. **Change review** — walk any change to confirm it matches the ask.
 3. **Codebase onboarding** — get a whole system explained start to finish, step by step.
 
-Voice is the point. A **sidebar transcript** is its companion, so the reasoning is still there to
+Voice is the point. A **sidebar transcript** also accompanies it, so the reasoning is still there to
 re-scan after the audio moves on.
 
 ---
@@ -41,8 +41,12 @@ A walk carries an absolute `basePath`. The daemon routes it to the window whose 
 **equals** that path, else the **deepest parent**, else the **earliest-registered** window. Exactly
 **one walk plays machine-wide at a time** (it's a single voice).
 
+```
+  basePath ─▶  exact root  ──else──▶  deepest parent  ──else──▶  earliest registered
+```
+
 `patchwalk.play` returns as soon as the walk is **launched** — it never blocks while narration plays.
-You drive the running walk from the Patchwalk sidebar (pause, next, stop, replay, jump).
+You don't have to, but you could drive the running walk from the Patchwalk sidebar (pause, next, stop, replay, jump).
 
 ---
 
