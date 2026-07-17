@@ -1,7 +1,7 @@
 {
     "name": "patchwalk",
     "displayName": "Patchwalk",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "Narrate your codebase in natural language. Works with any agent that supports MCP.",
     "publisher": "coderabbi",
     "private": true,
