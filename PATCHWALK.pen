@@ -102,6 +102,601 @@
           "height": 84
         }
       ]
+    },
+    {
+      "type": "frame",
+      "id": "v5bTx",
+      "x": 1240,
+      "y": 0,
+      "name": "Icon / V2 Voice bubble",
+      "clip": true,
+      "width": 256,
+      "height": 256,
+      "fill": {
+        "type": "gradient",
+        "gradientType": "radial",
+        "enabled": true,
+        "rotation": 0,
+        "size": {
+          "width": 1,
+          "height": 1
+        },
+        "colors": [
+          {
+            "color": "#1E2735",
+            "position": 0
+          },
+          {
+            "color": "#161B24",
+            "position": 1
+          }
+        ]
+      },
+      "cornerRadius": 56,
+      "layout": "none",
+      "children": [
+        {
+          "type": "path",
+          "id": "mKXm8",
+          "x": 50,
+          "y": 141,
+          "name": "Tail",
+          "geometry": "M44 0l-38 52 38-22z",
+          "viewBox": [
+            0,
+            0,
+            44,
+            54
+          ],
+          "fill": "#E5A50A",
+          "width": 44,
+          "height": 54
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": 38,
+          "id": "aMF0L",
+          "x": 50,
+          "y": 46,
+          "name": "Bubble",
+          "fill": "#E5A50A",
+          "width": 156,
+          "height": 126,
+          "effect": {
+            "type": "shadow",
+            "shadowType": "outer",
+            "color": "#E5A50A44",
+            "blur": 26
+          }
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": 7,
+          "id": "mpWhU",
+          "x": 69,
+          "y": 92,
+          "name": "Wave 0",
+          "fill": "#1C2432",
+          "width": 14,
+          "height": 34
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": 7,
+          "id": "I2UKYD",
+          "x": 95,
+          "y": 83,
+          "name": "Wave 1",
+          "fill": "#1C2432",
+          "width": 14,
+          "height": 52
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": 7,
+          "id": "Ncojn",
+          "x": 121,
+          "y": 75,
+          "name": "Wave 2",
+          "fill": "#1C2432",
+          "width": 14,
+          "height": 68
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": 7,
+          "id": "vMRE4",
+          "x": 147,
+          "y": 83,
+          "name": "Wave 3",
+          "fill": "#1C2432",
+          "width": 14,
+          "height": 52
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": 7,
+          "id": "lQ6lU",
+          "x": 173,
+          "y": 92,
+          "name": "Wave 4",
+          "fill": "#1C2432",
+          "width": 14,
+          "height": 34
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "p1nUhZ",
+      "x": 1560,
+      "y": 0,
+      "name": "Icon / V3 Monogram P",
+      "clip": true,
+      "width": 256,
+      "height": 256,
+      "fill": {
+        "type": "gradient",
+        "gradientType": "radial",
+        "enabled": true,
+        "rotation": 0,
+        "size": {
+          "width": 1,
+          "height": 1
+        },
+        "colors": [
+          {
+            "color": "#1E2735",
+            "position": 0
+          },
+          {
+            "color": "#161B24",
+            "position": 1
+          }
+        ]
+      },
+      "cornerRadius": 56,
+      "layout": "none",
+      "children": [
+        {
+          "type": "rectangle",
+          "cornerRadius": 16,
+          "id": "J80Q3",
+          "x": 82,
+          "y": 52,
+          "name": "Stem",
+          "fill": "#E5A50A",
+          "width": 40,
+          "height": 152,
+          "effect": {
+            "type": "shadow",
+            "shadowType": "outer",
+            "color": "#E5A50A33",
+            "blur": 24
+          }
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": [
+            14,
+            46,
+            46,
+            14
+          ],
+          "id": "RtX3J",
+          "x": 104,
+          "y": 52,
+          "name": "Bowl",
+          "fill": "#E5A50A",
+          "width": 84,
+          "height": 92
+        },
+        {
+          "type": "path",
+          "id": "A7Lcp8",
+          "x": 123,
+          "y": 74,
+          "name": "Play counter",
+          "geometry": "M12 8l26 16-26 16z",
+          "viewBox": [
+            0,
+            0,
+            46,
+            48
+          ],
+          "fill": "#1C2432",
+          "width": 46,
+          "height": 48
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "mftLt",
+      "x": 1880,
+      "y": 0,
+      "name": "Icon / V4 Play + arcs",
+      "clip": true,
+      "width": 256,
+      "height": 256,
+      "fill": {
+        "type": "gradient",
+        "gradientType": "radial",
+        "enabled": true,
+        "rotation": 0,
+        "size": {
+          "width": 1,
+          "height": 1
+        },
+        "colors": [
+          {
+            "color": "#1E2735",
+            "position": 0
+          },
+          {
+            "color": "#161B24",
+            "position": 1
+          }
+        ]
+      },
+      "cornerRadius": 56,
+      "layout": "none",
+      "children": [
+        {
+          "type": "path",
+          "id": "U3lUeS",
+          "x": 58,
+          "y": 84,
+          "name": "Play",
+          "geometry": "M16.7 9.5l68.6 35q10.7 5.5 0 11l-68.6 35q-10.7 5.5-10.7-6.5l0-68q0-12 10.7-6.5z",
+          "viewBox": [
+            0,
+            0,
+            100,
+            100
+          ],
+          "fill": "#E5A50A",
+          "width": 70,
+          "height": 88
+        },
+        {
+          "type": "path",
+          "id": "ufJR4",
+          "x": 0,
+          "y": 0,
+          "name": "Arc inner",
+          "geometry": "M147.2 105a32 32 0 0 1 0 46",
+          "viewBox": [
+            0,
+            0,
+            256,
+            256
+          ],
+          "fill": "#00000000",
+          "width": 256,
+          "height": 256,
+          "stroke": "#E5A50A",
+          "strokeWidth": 12,
+          "strokeLinecap": "round"
+        },
+        {
+          "type": "path",
+          "id": "Cg5Su",
+          "x": 0,
+          "y": 0,
+          "name": "Arc outer",
+          "geometry": "M158.4 93.5a48 48 0 0 1 0 69",
+          "viewBox": [
+            0,
+            0,
+            256,
+            256
+          ],
+          "fill": "#00000000",
+          "width": 256,
+          "height": 256,
+          "stroke": "#E5A50A",
+          "strokeWidth": 12,
+          "strokeLinecap": "round"
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "Rx5uo",
+      "x": 2200,
+      "y": 0,
+      "name": "Icon / V5 The walk",
+      "clip": true,
+      "width": 256,
+      "height": 256,
+      "fill": {
+        "type": "gradient",
+        "gradientType": "radial",
+        "enabled": true,
+        "rotation": 0,
+        "size": {
+          "width": 1,
+          "height": 1
+        },
+        "colors": [
+          {
+            "color": "#1E2735",
+            "position": 0
+          },
+          {
+            "color": "#161B24",
+            "position": 1
+          }
+        ]
+      },
+      "cornerRadius": 56,
+      "layout": "none",
+      "children": [
+        {
+          "type": "path",
+          "id": "m8xR8l",
+          "x": 42,
+          "y": 72,
+          "name": "Play start",
+          "geometry": "M16.7 9.5l68.6 35q10.7 5.5 0 11l-68.6 35q-10.7 5.5-10.7-6.5l0-68q0-12 10.7-6.5z",
+          "viewBox": [
+            0,
+            0,
+            100,
+            100
+          ],
+          "fill": "#E5A50A",
+          "width": 36,
+          "height": 36
+        },
+        {
+          "type": "path",
+          "id": "jQbgh",
+          "x": 0,
+          "y": 0,
+          "name": "Steps",
+          "geometry": "M84 90l40 0 0 40 40 0 0 40 42 0",
+          "viewBox": [
+            0,
+            0,
+            256,
+            256
+          ],
+          "fill": "#00000000",
+          "width": 256,
+          "height": 256,
+          "stroke": "#E5A50A",
+          "strokeWidth": 24,
+          "strokeLinejoin": "round",
+          "strokeLinecap": "round"
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "UTpaD",
+      "x": 2520,
+      "y": 0,
+      "name": "Icon / V6 code-play",
+      "clip": true,
+      "width": 256,
+      "height": 256,
+      "fill": {
+        "type": "gradient",
+        "gradientType": "radial",
+        "enabled": true,
+        "rotation": 0,
+        "size": {
+          "width": 1,
+          "height": 1
+        },
+        "colors": [
+          {
+            "color": "#1E2735",
+            "position": 0
+          },
+          {
+            "color": "#161B24",
+            "position": 1
+          }
+        ]
+      },
+      "cornerRadius": 56,
+      "layout": "none",
+      "children": [
+        {
+          "type": "path",
+          "id": "dgcHM",
+          "x": 24,
+          "y": 50,
+          "name": "Left bracket",
+          "geometry": "M86 78l-36 50 36 50",
+          "viewBox": [
+            0,
+            0,
+            256,
+            256
+          ],
+          "fill": "#00000000",
+          "width": 186,
+          "height": 156,
+          "stroke": "#E5A50A",
+          "strokeWidth": 20,
+          "strokeLinejoin": "round",
+          "strokeLinecap": "round"
+        },
+        {
+          "type": "path",
+          "id": "V2QROO",
+          "x": -12.378422043074806,
+          "y": 17.498289187732667,
+          "name": "Slash",
+          "rotation": 7.378568529129632,
+          "geometry": "M100 180l38-104",
+          "viewBox": [
+            0,
+            0,
+            256,
+            256
+          ],
+          "fill": "#00000000",
+          "width": 256,
+          "height": 256,
+          "stroke": "#E5A50A",
+          "strokeWidth": 20,
+          "strokeLinecap": "round"
+        },
+        {
+          "type": "path",
+          "id": "DNHlo",
+          "x": 148,
+          "y": 80,
+          "name": "Play (the >)",
+          "geometry": "M25.6 14l47.3 24.2q23.1 11.8 0 23.6l-47.3 24.2q-19.6 10-19.6-12l0-48q0-22 19.6-12z",
+          "viewBox": [
+            0,
+            0,
+            100,
+            100
+          ],
+          "fill": "#E5A50A",
+          "width": 64,
+          "height": 96
+        }
+      ]
+    },
+    {
+      "type": "frame",
+      "id": "E9oDGO",
+      "x": 2840,
+      "y": 0,
+      "name": "Icon / V7 code bubble",
+      "clip": true,
+      "width": 256,
+      "height": 256,
+      "fill": {
+        "type": "gradient",
+        "gradientType": "radial",
+        "enabled": true,
+        "rotation": 0,
+        "size": {
+          "width": 1,
+          "height": 1
+        },
+        "colors": [
+          {
+            "color": "#1E2735",
+            "position": 0
+          },
+          {
+            "color": "#161B24",
+            "position": 1
+          }
+        ]
+      },
+      "cornerRadius": 56,
+      "layout": "none",
+      "children": [
+        {
+          "type": "path",
+          "id": "w1YWtm",
+          "x": 60,
+          "y": 141,
+          "name": "Tail",
+          "geometry": "M44 0l-38 52 38-22z",
+          "viewBox": [
+            0,
+            0,
+            44,
+            54
+          ],
+          "fill": "#E5A50A",
+          "width": 44,
+          "height": 54
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": 38,
+          "id": "ETnAd",
+          "x": 50,
+          "y": 46,
+          "name": "Bubble",
+          "fill": "#E5A50A",
+          "width": 156,
+          "height": 126,
+          "effect": {
+            "type": "shadow",
+            "shadowType": "outer",
+            "color": "#E5A50A44",
+            "blur": 26
+          }
+        },
+        {
+          "type": "path",
+          "id": "KVPNQ",
+          "x": 9,
+          "y": 19,
+          "name": "Bracket",
+          "geometry": "M86 88l-14 21 14 21",
+          "viewBox": [
+            0,
+            0,
+            256,
+            256
+          ],
+          "fill": "#00000000",
+          "width": 256,
+          "height": 210,
+          "stroke": "#1C2432",
+          "strokeWidth": 14,
+          "strokeLinejoin": "round",
+          "strokeLinecap": "round"
+        },
+        {
+          "type": "path",
+          "id": "I4spP",
+          "x": -42.9191321997605,
+          "y": 0.7677866781486529,
+          "name": "Slash",
+          "rotation": 13.719185081085756,
+          "geometry": "M92 132l22-46",
+          "viewBox": [
+            0,
+            0,
+            256,
+            256
+          ],
+          "fill": "#00000000",
+          "width": 336,
+          "height": 336,
+          "stroke": "#1C2432",
+          "strokeWidth": 14,
+          "strokeLinecap": "round"
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": 7,
+          "id": "GOVns",
+          "x": 142,
+          "y": 80,
+          "name": "Wave 1",
+          "fill": "#1C2432",
+          "width": 14,
+          "height": 58
+        },
+        {
+          "type": "rectangle",
+          "cornerRadius": 7,
+          "id": "fQpi1",
+          "x": 168,
+          "y": 88,
+          "name": "Wave 2",
+          "fill": "#1C2432",
+          "width": 14,
+          "height": 42
+        }
+      ]
     }
   ],
   "fileToken": "dbf36505-d897-49a3-b435-7130d0b7b577"

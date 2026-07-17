@@ -2,7 +2,7 @@
     "name": "patchwalk",
     "displayName": "Patchwalk",
     "version": "0.1.0",
-    "description": "Hear your AI agent's code changes explained out loud — a spoken, highlighted walkthrough of every patch, right inside your editor.",
+    "description": "Narrate your codebase in natural language. Works with any agent that supports MCP.",
     "publisher": "coderabbi",
     "private": true,
     "preview": true,
@@ -170,7 +170,8 @@
                 {
                     "id": "patchwalk.walkMonitor",
                     "type": "webview",
-                    "name": "Walk Monitor"
+                    "name": "Walk Monitor",
+                    "icon": "assets/patchwalk-activitybar.svg"
                 }
             ]
         },
