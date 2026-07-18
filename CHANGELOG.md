@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.3 — one-click agent setup
+
+### One-click agent setup
+
+- On first activation, Patchwalk now **auto-connects** its MCP server into every AI agent it finds on
+  your machine — **Claude Code, Cursor, VS Code (Copilot), Windsurf, Claude Desktop, Cline, Roo Code,
+  Codex, Gemini CLI, and Continue** — and tells you which to restart. No more hand-editing config
+  files; usually you just restart the agent.
+- The merge is surgical and safe: only the `patchwalk` entry is written, other servers/keys/comments
+  are preserved, each file is written atomically with a one-time backup, and the result is verified
+  before it lands. It skips agents that aren't installed, and is idempotent.
+- Each agent gets the right shape automatically (the fields differ in ways that silently break a
+  connection): `url` vs `serverUrl` vs `httpUrl`, VS Code's `servers` key, Cline's `streamableHttp`
+  vs Roo's `streamable-http`, Codex's TOML, Continue's YAML list, and an `mcp-remote` bridge for
+  Claude Desktop (which has no native HTTP transport).
+- Re-run any time with the **Patchwalk: Connect My Agents** command. Anything that can't be wired up
+  gets a copy-paste manual-setup fallback in the notification.
+
 ## 0.1.0 — first preview
 
 The first public preview of Patchwalk: your AI agent finishes a change, and Patchwalk **explains it
