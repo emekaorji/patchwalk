@@ -55,8 +55,17 @@ You don't have to, but you could drive the running walk from the Patchwalk sideb
 1. **Install the extension.** On first activation it starts a small local daemon automatically — you
    do _not_ install a separate MCP server. It shuts itself down when no editor windows are left.
 
-2. **Point your agent at it.** This is the only required step; without it Patchwalk has nothing to
-   say. The endpoint is `http://127.0.0.1:7357/mcp` (Streamable HTTP).
+2. **Restart your AI agent.** On first activation Patchwalk **auto-connects itself** to the agents it
+   finds on your machine — Claude Code, Cursor, VS Code (Copilot), Windsurf, Claude Desktop, Cline,
+   Roo Code, Codex, Gemini CLI, and Continue — by writing its MCP server into each one's config, then
+   tells you which to restart. Usually that's all you do. Run it again any time with **Patchwalk:
+   Connect My Agents**.
+
+   <details>
+   <summary><b>Manual setup</b> — only if your agent wasn't detected, or auto-connect couldn't write its config</summary>
+
+   The endpoint is `http://127.0.0.1:7357/mcp` (Streamable HTTP). **Patchwalk: Copy MCP Endpoint**
+   copies it (with the right port if you changed it). The exact field differs by agent:
 
    **Claude Code**
 
@@ -64,7 +73,8 @@ You don't have to, but you could drive the running walk from the Patchwalk sideb
    claude mcp add --transport http patchwalk http://127.0.0.1:7357/mcp
    ```
 
-   **Any editor/agent that uses an `mcpServers` JSON config** (`.mcp.json`, Cursor, Windsurf, …)
+   **Cursor and most `mcpServers` JSON configs** — Windsurf uses `serverUrl`, Gemini CLI uses
+   `httpUrl`, VS Code uses a top-level `servers` key:
 
    ```json
    {
@@ -81,7 +91,7 @@ You don't have to, but you could drive the running walk from the Patchwalk sideb
    url = "http://127.0.0.1:7357/mcp"
    ```
 
-   (The command **Patchwalk: Copy MCP Endpoint** copies the right URL if you changed the port.)
+   </details>
 
 3. **Ask for a walk.** After your agent makes a change:
 
