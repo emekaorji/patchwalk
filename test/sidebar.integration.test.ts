@@ -47,7 +47,11 @@ describe('walk monitor provider (real editor glue)', () => {
         runner?.dispose();
         provider = undefined;
         runner = undefined;
-        await rm(tempDir, { recursive: true, force: true });
+        // Windows can briefly lock files the editor just opened; retry, and never let a
+        // cleanup EBUSY fail the test (a leaked temp dir in CI is harmless).
+        await rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(
+            () => {},
+        );
     });
 
     const createPayload = (): PatchwalkHandoffPayload => ({

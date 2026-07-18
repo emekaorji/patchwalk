@@ -1,5 +1,6 @@
 import { deepStrictEqual, match, ok, strictEqual } from 'node:assert';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 import process from 'node:process';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -30,6 +31,13 @@ import {
 import { matchBasePathToWorkspaceRoots } from '../src/lib/routing';
 import type { PatchwalkHandoffPayload } from '../src/lib/schema';
 import { patchwalkHandoffPayloadSchema } from '../src/lib/schema';
+
+/**
+ * Test fixtures use POSIX-looking absolute paths. `path.resolve` turns them into the OS-native
+ * absolute form (e.g. D:\tmp\... on Windows); because these dirs do not exist, the daemon's
+ * normalizeAbsolutePath is then a no-op, so routing and assertions agree on every OS.
+ */
+const abs = (posixPath: string): string => path.resolve(posixPath);
 
 interface PatchwalkHealthResponse {
     ok: boolean;
@@ -384,7 +392,7 @@ describe('patchwalk mcp server', () => {
             daemonEntryPath: '/unused/in-tests',
             port: busyServer.listeningPort!,
         });
-        const attached = new FakePatchwalkWorker(busyClient, ['/tmp/keep-alive']);
+        const attached = new FakePatchwalkWorker(busyClient, [abs('/tmp/keep-alive')]);
         await attached.start();
 
         await new Promise((resolve) => setTimeout(resolve, 400));
@@ -464,7 +472,7 @@ describe('patchwalk mcp server', () => {
         strictEqual('$schema' in (playProperties ?? {}), false);
         // ...but must still be ACCEPTED by the payload validator when an agent sends it.
         const withSchemaPointer = {
-            ...createPayload('/tmp/schema-pointer'),
+            ...createPayload(abs('/tmp/schema-pointer')),
             $schema: 'https://patchwalk.dev/handoff.schema.json',
         };
         strictEqual(patchwalkHandoffPayloadSchema.safeParse(withSchemaPointer).success, true);
@@ -489,7 +497,7 @@ describe('patchwalk mcp server', () => {
         // AFTER the daemon learns it must serve the grounded caps.
         const worker = new FakePatchwalkWorker(
             daemonClient,
-            ['/tmp/style-root'],
+            [abs('/tmp/style-root')],
             'test-extension',
             {
                 narrationStyle: 'grounded',
@@ -559,11 +567,11 @@ describe('patchwalk mcp server', () => {
     });
 
     it('accepts and routes a nested walk that carries sub-segments', async () => {
-        const worker = new FakePatchwalkWorker(daemonClient, ['/tmp/segmented-root']);
+        const worker = new FakePatchwalkWorker(daemonClient, [abs('/tmp/segmented-root')]);
         workers.push(worker);
         await worker.start();
 
-        const payload = createPayload('/tmp/segmented-root');
+        const payload = createPayload(abs('/tmp/segmented-root'));
         payload.walkthrough[0].segments = [
             {
                 id: 'a',
@@ -604,7 +612,7 @@ describe('patchwalk mcp server', () => {
     });
 
     it('reports worker and active-handoff status through the status resource', async () => {
-        const projectRoot = '/tmp/patchwalk-project';
+        const projectRoot = abs('/tmp/patchwalk-project');
         const worker = new FakePatchwalkWorker(daemonClient, [projectRoot]);
         workers.push(worker);
         await worker.start();
@@ -624,14 +632,14 @@ describe('patchwalk mcp server', () => {
     });
 
     it('routes playback to the exact matching worker', async () => {
-        const parentWorker = new FakePatchwalkWorker(daemonClient, ['/tmp']);
-        const exactWorker = new FakePatchwalkWorker(daemonClient, ['/tmp/patchwalk-project']);
+        const parentWorker = new FakePatchwalkWorker(daemonClient, [abs('/tmp')]);
+        const exactWorker = new FakePatchwalkWorker(daemonClient, [abs('/tmp/patchwalk-project')]);
         workers.push(parentWorker, exactWorker);
 
         await parentWorker.start();
         await exactWorker.start();
 
-        const payload = createPayload('/tmp/patchwalk-project');
+        const payload = createPayload(abs('/tmp/patchwalk-project'));
         const playResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
             arguments: payload,
@@ -651,12 +659,12 @@ describe('patchwalk mcp server', () => {
         strictEqual(exactWorker.executedPayloads.length, 1);
         strictEqual(structuredContent?.status, 'launched');
         strictEqual(structuredContent?.workerId, exactWorker.workerId);
-        strictEqual(structuredContent?.matchedRoot, '/tmp/patchwalk-project');
+        strictEqual(structuredContent?.matchedRoot, abs('/tmp/patchwalk-project'));
     });
 
     it('uses the deepest parent-path match when no exact worker exists', async () => {
-        const shallowWorker = new FakePatchwalkWorker(daemonClient, ['/tmp/patchwalk']);
-        const deepWorker = new FakePatchwalkWorker(daemonClient, ['/tmp/patchwalk/project']);
+        const shallowWorker = new FakePatchwalkWorker(daemonClient, [abs('/tmp/patchwalk')]);
+        const deepWorker = new FakePatchwalkWorker(daemonClient, [abs('/tmp/patchwalk/project')]);
         workers.push(shallowWorker, deepWorker);
 
         await shallowWorker.start();
@@ -664,7 +672,7 @@ describe('patchwalk mcp server', () => {
 
         const playResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: createPayload('/tmp/patchwalk/project/service'),
+            arguments: createPayload(abs('/tmp/patchwalk/project/service')),
         });
         const structuredContent = playResult.structuredContent as
             | {
@@ -677,12 +685,12 @@ describe('patchwalk mcp server', () => {
         strictEqual(shallowWorker.executedPayloads.length, 0);
         strictEqual(deepWorker.executedPayloads.length, 1);
         strictEqual(structuredContent?.workerId, deepWorker.workerId);
-        strictEqual(structuredContent?.matchedRoot, '/tmp/patchwalk/project');
+        strictEqual(structuredContent?.matchedRoot, abs('/tmp/patchwalk/project'));
     });
 
     it('uses earliest registration as the final tie-breaker', async () => {
-        const firstWorker = new FakePatchwalkWorker(daemonClient, ['/tmp/shared-root']);
-        const secondWorker = new FakePatchwalkWorker(daemonClient, ['/tmp/shared-root']);
+        const firstWorker = new FakePatchwalkWorker(daemonClient, [abs('/tmp/shared-root')]);
+        const secondWorker = new FakePatchwalkWorker(daemonClient, [abs('/tmp/shared-root')]);
         workers.push(firstWorker, secondWorker);
 
         await firstWorker.start();
@@ -690,7 +698,7 @@ describe('patchwalk mcp server', () => {
 
         const playResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: createPayload('/tmp/shared-root/project'),
+            arguments: createPayload(abs('/tmp/shared-root/project')),
         });
         const structuredContent = playResult.structuredContent as
             | {
@@ -705,13 +713,13 @@ describe('patchwalk mcp server', () => {
     });
 
     it('returns a tool error when no live worker matches the base path', async () => {
-        const worker = new FakePatchwalkWorker(daemonClient, ['/tmp/unrelated-root']);
+        const worker = new FakePatchwalkWorker(daemonClient, [abs('/tmp/unrelated-root')]);
         workers.push(worker);
         await worker.start();
 
         const playResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: createPayload('/tmp/expected-root'),
+            arguments: createPayload(abs('/tmp/expected-root')),
         });
         const content = playResult.content as Array<{ type: string; text?: string }>;
 
@@ -723,7 +731,7 @@ describe('patchwalk mcp server', () => {
     it('launches, then rejects a second walk while one is active, and allows stop', async () => {
         const worker = new FakePatchwalkWorker(
             daemonClient,
-            ['/tmp/patchwalk-project'],
+            [abs('/tmp/patchwalk-project')],
             'test-extension',
             {
                 holdExecutionUntilStopped: true,
@@ -735,7 +743,7 @@ describe('patchwalk mcp server', () => {
         // launch+ack: patchwalk.play returns immediately even though the worker holds the walk open.
         const firstPlayResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: createPayload('/tmp/patchwalk-project'),
+            arguments: createPayload(abs('/tmp/patchwalk-project')),
         });
         strictEqual(firstPlayResult.isError ?? false, false);
         strictEqual((firstPlayResult.structuredContent as { status?: string })?.status, 'launched');
@@ -743,7 +751,7 @@ describe('patchwalk mcp server', () => {
 
         const secondPlayResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: createPayload('/tmp/patchwalk-project'),
+            arguments: createPayload(abs('/tmp/patchwalk-project')),
         });
         const secondContent = secondPlayResult.content as Array<{ type: string; text?: string }>;
 
@@ -777,18 +785,18 @@ describe('patchwalk mcp server', () => {
         // must be the matched ROOT, not the deeper basePath — a stricter assertion than exact match.
         const playing = new FakePatchwalkWorker(
             daemonClient,
-            ['/tmp/owner-root'],
+            [abs('/tmp/owner-root')],
             'test-extension',
             { holdExecutionUntilStopped: true },
         );
-        const bystander = new FakePatchwalkWorker(daemonClient, ['/tmp/other-root']);
+        const bystander = new FakePatchwalkWorker(daemonClient, [abs('/tmp/other-root')]);
         workers.push(playing, bystander);
         await playing.start();
         await bystander.start();
 
         const playResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: createPayload('/tmp/owner-root/service/deep'),
+            arguments: createPayload(abs('/tmp/owner-root/service/deep')),
         });
         strictEqual((playResult.structuredContent as { status?: string })?.status, 'launched');
         await playing.startedExecution.promise;
@@ -799,7 +807,7 @@ describe('patchwalk mcp server', () => {
         strictEqual(latest.active, true);
         strictEqual(latest.ownerWorkerId, playing.workerId);
         // Distinguishes selectedMatchedRoot from the basePath fallback.
-        strictEqual(latest.revealPath, '/tmp/owner-root');
+        strictEqual(latest.revealPath, abs('/tmp/owner-root'));
 
         await client.callTool({ name: PATCHWALK_STOP_TOOL_NAME, arguments: {} });
         await new Promise((resolve) => setTimeout(resolve, 50));
@@ -810,15 +818,15 @@ describe('patchwalk mcp server', () => {
     it('clears walk ownership everywhere when a walk completes naturally', async () => {
         // No holdExecutionUntilStopped → the worker starts then immediately completes, exercising the
         // handlePlaybackCompleted -> clearActiveDispatch -> broadcast(active:false) path.
-        const playing = new FakePatchwalkWorker(daemonClient, ['/tmp/complete-root']);
-        const bystander = new FakePatchwalkWorker(daemonClient, ['/tmp/other-root']);
+        const playing = new FakePatchwalkWorker(daemonClient, [abs('/tmp/complete-root')]);
+        const bystander = new FakePatchwalkWorker(daemonClient, [abs('/tmp/other-root')]);
         workers.push(playing, bystander);
         await playing.start();
         await bystander.start();
 
         await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: createPayload('/tmp/complete-root'),
+            arguments: createPayload(abs('/tmp/complete-root')),
         });
         await new Promise((resolve) => setTimeout(resolve, 80));
 
@@ -850,7 +858,7 @@ describe('patchwalk mcp server', () => {
     it('clears active state when the worker disconnects during stop', async () => {
         const worker = new FakePatchwalkWorker(
             daemonClient,
-            ['/tmp/patchwalk-project'],
+            [abs('/tmp/patchwalk-project')],
             'test-extension',
             {
                 holdExecutionUntilStopped: true,
@@ -862,7 +870,7 @@ describe('patchwalk mcp server', () => {
 
         const firstPlayResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: createPayload('/tmp/patchwalk-project'),
+            arguments: createPayload(abs('/tmp/patchwalk-project')),
         });
         strictEqual((firstPlayResult.structuredContent as { status?: string })?.status, 'launched');
         await worker.startedExecution.promise;
@@ -940,7 +948,7 @@ describe('patchwalk mcp server', () => {
     it('launch+ack returns before the walk completes', async () => {
         const worker = new FakePatchwalkWorker(
             daemonClient,
-            ['/tmp/held-project'],
+            [abs('/tmp/held-project')],
             'test-extension',
             { holdExecutionUntilStopped: true },
         );
@@ -949,7 +957,7 @@ describe('patchwalk mcp server', () => {
 
         const playResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: createPayload('/tmp/held-project'),
+            arguments: createPayload(abs('/tmp/held-project')),
         });
         const content = playResult.structuredContent as
             | { status?: string; walkId?: string; workerId?: string; steps?: number }
@@ -972,13 +980,13 @@ describe('patchwalk mcp server', () => {
         this.timeout(10_000);
         const wedged = new FakePatchwalkWorker(
             daemonClient,
-            ['/tmp/failover-root'],
+            [abs('/tmp/failover-root')],
             'test-extension',
             { neverReady: true },
         );
         const healthy = new FakePatchwalkWorker(
             daemonClient,
-            ['/tmp/failover-root'],
+            [abs('/tmp/failover-root')],
             'test-extension',
         );
         workers.push(wedged, healthy);
@@ -987,7 +995,7 @@ describe('patchwalk mcp server', () => {
 
         const playResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: createPayload('/tmp/failover-root/project'),
+            arguments: createPayload(abs('/tmp/failover-root/project')),
         });
         const content = playResult.structuredContent as
             | { status?: string; workerId?: string }
@@ -1004,7 +1012,7 @@ describe('patchwalk mcp server', () => {
         this.timeout(10_000);
         const wedged = new FakePatchwalkWorker(
             daemonClient,
-            ['/tmp/zombie-root'],
+            [abs('/tmp/zombie-root')],
             'test-extension',
             { neverReady: true },
         );
@@ -1014,7 +1022,7 @@ describe('patchwalk mcp server', () => {
         const startedAt = Date.now();
         const playResult = await client.callTool({
             name: PATCHWALK_PLAY_TOOL_NAME,
-            arguments: createPayload('/tmp/zombie-root'),
+            arguments: createPayload(abs('/tmp/zombie-root')),
         });
         const elapsedMs = Date.now() - startedAt;
 
