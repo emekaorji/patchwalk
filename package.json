@@ -84,6 +84,10 @@
             {
                 "command": "patchwalk.copyMcpEndpoint",
                 "title": "Patchwalk: Copy MCP Endpoint"
+            },
+            {
+                "command": "patchwalk.connectAgents",
+                "title": "Patchwalk: Connect My Agents"
             }
         ],
         "configuration": {
@@ -251,7 +255,9 @@
     },
     "dependencies": {
         "@modelcontextprotocol/sdk": "^1.27.1",
+        "jsonc-parser": "^3.3.1",
         "ws": "^8.19.0",
+        "yaml": "^2.9.0",
         "zod": "^4.3.6"
     },
     "galleryBanner": {
