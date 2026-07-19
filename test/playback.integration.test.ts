@@ -60,7 +60,11 @@ describe('patchwalk playback (real editor)', () => {
         runner?.dispose();
         runner = undefined;
         await vscode.commands.executeCommand('workbench.action.closeAllEditors');
-        await rm(tempDir, { recursive: true, force: true });
+        // Windows can briefly lock files the editor just opened; retry, and never let a
+        // cleanup EBUSY fail the test (a leaked temp dir in CI is harmless).
+        await rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(
+            () => {},
+        );
     });
 
     const createPayload = (): PatchwalkHandoffPayload => {

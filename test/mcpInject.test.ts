@@ -1,4 +1,5 @@
 import { deepStrictEqual, match, ok, strictEqual, throws } from 'node:assert';
+import process from 'node:process';
 
 import { parse as parseYaml } from 'yaml';
 
@@ -153,7 +154,18 @@ describe('mcp injector — safe merge (never clobber the user)', () => {
 });
 
 describe('mcp injector — orchestration', () => {
-    const host: Host = { home: '/Users/u', appData: undefined, platform: 'darwin' };
+    // Use the RUNNING platform so adapter path-joining (which uses node:path) matches on every OS.
+    const host: Host = {
+        home: process.platform === 'win32' ? String.raw`C:\Users\u` : '/Users/u',
+        appData: process.platform === 'win32' ? String.raw`C:\Users\u\AppData\Roaming` : undefined,
+        platform: process.platform,
+    };
+    /**
+     * Derive the real per-OS paths from the adapters themselves (no hardcoded separators).
+     */
+    const candidate = (id: string) => adapter(id).candidates(host)[0];
+    const cursor = candidate('cursor');
+    const gemini = candidate('gemini-cli');
 
     const fakeIo = (init: { files?: Record<string, string>; dirs?: string[] }) => {
         const files = new Map(Object.entries(init.files ?? {}));
@@ -179,13 +191,12 @@ describe('mcp injector — orchestration', () => {
 
     it('connects an installed agent and skips uninstalled ones', () => {
         // Only Cursor "installed" (its marker dir exists); nothing else.
-        const { io, writes } = fakeIo({ dirs: ['/Users/u/.cursor'] });
+        const { io, writes } = fakeIo({ dirs: [cursor.markerDir] });
         const results = runInjection(host, URL, io);
 
-        const cursor = results.find((r) => r.id === 'cursor');
-        strictEqual(cursor?.outcome, 'connected');
+        strictEqual(results.find((r) => r.id === 'cursor')?.outcome, 'connected');
         strictEqual(writes.length, 1);
-        strictEqual(writes[0].path, '/Users/u/.cursor/mcp.json');
+        strictEqual(writes[0].path, cursor.path);
         strictEqual(writes[0].hadExisting, false);
 
         // Everything else is reported not-installed, and nothing else was written.
@@ -194,10 +205,7 @@ describe('mcp injector — orchestration', () => {
 
     it('reports already when the server is present and correct', () => {
         const existing = JSON.stringify({ mcpServers: { patchwalk: { url: URL } } });
-        const { io } = fakeIo({
-            dirs: ['/Users/u/.cursor'],
-            files: { '/Users/u/.cursor/mcp.json': existing },
-        });
+        const { io } = fakeIo({ dirs: [cursor.markerDir], files: { [cursor.path]: existing } });
         const results = runInjection(host, URL, io);
         strictEqual(results.find((r) => r.id === 'cursor')?.outcome, 'already');
     });
@@ -206,10 +214,10 @@ describe('mcp injector — orchestration', () => {
         const files = new Map<string, string>();
         const io: InjectorIO = {
             exists: (p) => files.has(p),
-            isDir: (p) => p === '/Users/u/.cursor' || p === '/Users/u/.gemini',
+            isDir: (p) => p === cursor.markerDir || p === gemini.markerDir,
             read: (p) => files.get(p) ?? '',
             writeAtomic: (p, text) => {
-                if (p.includes('.cursor')) {
+                if (p === cursor.path) {
                     throw new Error('disk on fire');
                 }
                 files.set(p, text);

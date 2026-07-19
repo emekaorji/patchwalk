@@ -1,8 +1,10 @@
 name: CI
 
 permissions:
-  contents: write
+  contents: write # so the version-bump commit can be pushed back
 
+# Push to main → run the full test matrix, then (if it passes and this isn't the
+# bot's own bump commit) build, bump the version, and publish. One workflow.
 on:
   push:
     branches:
@@ -14,8 +16,6 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    outputs:
-      GIT_TAG: ${{ steps.set-tag.outputs.GIT_TAG }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,48 +58,55 @@ jobs:
       - run: pnpm test
         if: runner.os != 'Linux'
 
-      - name: Set GIT_TAG
-        id: set-tag
-        if: runner.os == 'Linux'
-        run: |
-          git fetch --tags origin
-          GIT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -n "$GIT_TAG" ] && [ "$(git rev-list -n 1 $GIT_TAG 2>/dev/null || echo "")" = "$(git rev-parse HEAD)" ]; then
-            echo "GIT_TAG=${GIT_TAG}" >> $GITHUB_OUTPUT
-          else
-            echo "GIT_TAG=''" >> $GITHUB_OUTPUT
-          fi
-
-  publish:
+  release:
     needs: test
-    if: startsWith(needs.test.outputs.GIT_TAG, 'v')
+    # Skip the bot's own version-bump commit, so it doesn't loop forever.
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: pnpm/action-setup@v4
-        name: Install pnpm
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v4 # repo forbids npm
+      - uses: actions/setup-node@v4
         with:
-          cache: 'pnpm'
+          node-version: 20
+          cache: pnpm
 
-      - name: Install dependencies
-        run: pnpm install
+      - run: pnpm install --frozen-lockfile
 
-      - name: Publish to Visual Studio Marketplace
-        run: pnpm run publish:vs-marketplace
+      # The test matrix already built, compiled, and ran the suite on 3 OSes.
+      # Lint + package are the only gates it doesn't cover — run them before shipping.
+      - run: pnpm lint
+      - run: pnpm package
+
+      - name: Bump patch version
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          npm version patch -m "release: v%s [skip ci]"
+
+      - name: Publish to VS Code Marketplace
+        run: pnpm publish:vs-marketplace
         env:
-          VSCE_PAT: ${{ secrets.VS_MARKETPLACE_TOKEN }}
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
-      - name: Publish to Open VSX Registry
-        run: pnpm run publish:open-vsx -p ${{ secrets.OPEN_VSX_TOKEN }}
+      # Optional (Cursor / Windsurf / VSCodium). Won't fail the run if you skip Open VSX.
+      - name: Publish to Open VSX
+        continue-on-error: true
+        run: pnpm publish:open-vsx
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
 
-      - name: Github Release
+      - name: Push the version bump
+        run: git push --follow-tags
+
+      # Bonus (was already in ci.yml): cut a GitHub Release from the new tag.
+      # Non-fatal — a failure here never blocks a shipped release.
+      - name: GitHub Release
+        continue-on-error: true
         run: npx changelogithub
         env:
-          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
